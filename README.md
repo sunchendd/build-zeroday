@@ -27,8 +27,8 @@ git commit -m "chore(submodules): update zeroday patch refs"
 ```
 ## 镜像构建使用方式
 
-基于已有 vLLM/vLLM Ascend 镜像，把本仓库 submodule 中的补丁和依赖打进新镜像：
-
+基于已有 vLLM/vLLM Ascend 镜像，把本仓库 submodule 中的补丁和依赖打进新镜像，导出镜像包：
+vllm-ascend示例
 ```bash
 ./build-zeroday-image.sh \
   -b quay.io/ascend/vllm-ascend:v0.19.1rc1-a3 \
@@ -37,8 +37,7 @@ git commit -m "chore(submodules): update zeroday patch refs"
   -o Wings_vllm_ascend_v0.19.1rc1_800I_A3_glm5.1_aarch64.tar
 ```
 
-导出镜像包：
-
+vllm示例
 ```bash
 ./build-zeroday-image.sh \
   -b swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/vllm/vllm-openai:v0.22.0 \
