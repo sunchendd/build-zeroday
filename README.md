@@ -5,24 +5,21 @@
 
 基于已有 vLLM/vLLM Ascend 镜像，把本仓库 submodule 中的补丁和依赖打进新镜像：
 
+vllm-ascend 示例
 ```bash
 ./build-zeroday-image.sh \
   -b quay.io/ascend/vllm-ascend:v0.19.1rc1 \
   -e vllm-ascend \
-  -v 0.19.1rc1 \
-  -t quay.io/ascend/vllm-ascend:v0.19.1rc1-a3
+  -v v0.19.1rc1 \
+  -o Wings_vllm_ascend_v0.19.1rc1_800I_A3_glm5.1_aarch64.tar
 ```
-
-这里 `-b` 是输入的基础镜像，`-t` 是打完补丁后的输出镜像 tag。如果不传 `-t`，脚本会默认在基础镜像 tag 后面追加 `-zeroday-YYYYmmddHHMMSS` 时间戳。
-
-导出镜像包：
-
+vllm 示例
 ```bash
 ./build-zeroday-image.sh \
   -b swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/vllm/vllm-openai:v0.22.0 \
   -e vllm \
-  -v 0.22.0 \
-  -o vllm-openai-v0.22.0-zeroday.tar
+  -v v0.22.0 \
+  -o Wings_vllm_v0.22.0_H20_deepseekv4flash-amd64.tar
 ```
 
 `-o/--output-tar` 是导出的镜像包路径，等价于 `--save`。
@@ -49,18 +46,13 @@
 首次拉取本仓库后初始化 submodule：
 
 ```bash
-git submodule update --init --recursive
-```
-
-每次同步主仓库和 submodule 最新代码：
-
-```bash
-git pull --recurse-submodules
+git clone https://github.com/sunchendd/build-zeroday.git
+cd build-zeroday
 git submodule update --init --recursive
 git submodule update --remote --merge vllm-ascend-zeroday vllm-zeroday
 ```
 
-如果 submodule 指针更新了，需要在主仓库提交新的指针：
+如果 submodule 指针更新了，可以在主仓库提交新的指针：
 
 ```bash
 git add vllm-ascend-zeroday vllm-zeroday
