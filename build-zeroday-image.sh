@@ -156,6 +156,7 @@ done
 [[ -n "$base_image" ]] || die "Missing --base-image"
 [[ -n "$engine" ]] || die "Missing --engine"
 [[ -n "$patch_version" ]] || die "Missing --patch-version"
+[[ "$patch_version" != *"/"* && "$patch_version" != *".."* ]] || die "Patch version must be a version directory name, not a path: $patch_version"
 [[ -f "$dockerfile" ]] || die "Dockerfile not found: $dockerfile"
 
 engine_dir="$(resolve_engine_dir "$engine")"
@@ -163,6 +164,7 @@ engine_dir="$(resolve_engine_dir "$engine")"
 
 patch_dir="${engine_dir}/${patch_version}"
 [[ -d "${repo_root}/${patch_dir}" ]] || die "Patch version directory not found: ${repo_root}/${patch_dir}"
+[[ -f "${repo_root}/${patch_dir}/${patch_script}" ]] || die "Patch script not found: ${repo_root}/${patch_dir}/${patch_script}"
 
 if [[ -z "$target_image" ]]; then
   target_image="$(default_target_image "$base_image" "$suffix" "$(date +%Y%m%d%H%M%S)")"

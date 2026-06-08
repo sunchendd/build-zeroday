@@ -13,8 +13,6 @@ RUN set -eux; \
       echo "Patch directory not found: ${patch_dir}" >&2; \
       exit 1; \
     fi; \
-    runner="sh"; \
-    if command -v bash >/dev/null 2>&1; then runner="bash"; fi; \
     if [ -f "${patch_dir}/apt-packages.txt" ]; then \
       if ! command -v apt-get >/dev/null 2>&1; then \
         echo "apt-packages.txt exists but apt-get is not available in the base image" >&2; \
@@ -31,10 +29,20 @@ RUN set -eux; \
       fi; \
       python3 -m pip install --no-cache-dir -r "${patch_dir}/requirements.txt"; \
     fi; \
+    runner="sh"; \
+    if command -v bash >/dev/null 2>&1; then runner="bash"; fi; \
     if [ -f "${patch_dir}/install-deps.sh" ]; then \
       chmod +x "${patch_dir}/install-deps.sh"; \
       cd "${patch_dir}"; \
       "${runner}" "./install-deps.sh"; \
+    fi; \
+    if ! command -v git >/dev/null 2>&1; then \
+      echo "git is required to apply patches but is not available in the base image" >&2; \
+      exit 1; \
+    fi; \
+    if ! command -v bash >/dev/null 2>&1; then \
+      echo "bash is required to run patch scripts but is not available in the base image" >&2; \
+      exit 1; \
     fi; \
     if [ ! -f "${patch_dir}/${PATCH_SCRIPT}" ]; then \
       echo "Patch script not found: ${patch_dir}/${PATCH_SCRIPT}" >&2; \
@@ -42,4 +50,4 @@ RUN set -eux; \
     fi; \
     chmod +x "${patch_dir}/${PATCH_SCRIPT}"; \
     cd "${patch_dir}"; \
-    "${runner}" "./${PATCH_SCRIPT}"
+    bash "./${PATCH_SCRIPT}"
