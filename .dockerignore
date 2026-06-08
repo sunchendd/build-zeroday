@@ -1,0 +1,6 @@
+.git
+**/.git
+*.tar
+*.tar.gz
+*.tgz
+*.log

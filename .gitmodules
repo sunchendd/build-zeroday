@@ -1,0 +1,8 @@
+[submodule "vllm-ascend-zeroday"]
+	path = vllm-ascend-zeroday
+	url = https://github.com/sunchendd/vllm-ascend-zeroday.git
+	branch = main
+[submodule "vllm-zeroday"]
+	path = vllm-zeroday
+	url = https://github.com/sunchendd/vllm-zeroday.git
+	branch = main
