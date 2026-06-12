@@ -43,13 +43,13 @@ vllm 示例
 
 `vllm-ascend-zeroday/` 和 `vllm-zeroday/` 是独立补丁仓库，在本仓库中以 submodule 方式引用。
 
-首次拉取本仓库后初始化 submodule：
+首次拉取本仓库后初始化 submodule（若 submodule 有本地修改，以下命令会强制丢弃本地修改并同步到最新远端）：
 
 ```bash
 git clone https://github.com/sunchendd/build-zeroday.git
 cd build-zeroday
-git submodule update --init --recursive
-git submodule update --remote --merge vllm-ascend-zeroday vllm-zeroday
+git submodule update --init
+git submodule foreach --recursive 'git fetch origin && git reset --hard origin/HEAD'
 ```
 
 如果 submodule 指针更新了，可以在主仓库提交新的指针：

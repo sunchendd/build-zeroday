@@ -47,6 +47,20 @@ normalize_image() {
   printf '%s' "${image//：/:}"
 }
 
+validate_arch() {
+  local file="$1"
+  local arch
+  arch="$(uname -m)"
+
+  if [[ "$file" == *"amd64"* && "$arch" != "x86_64" ]]; then
+    die "Output file name contains 'amd64' but current architecture is '${arch}' (expected x86_64)."
+  fi
+
+  if [[ "$file" == *"aarch64"* && "$arch" != "aarch64" ]]; then
+    die "Output file name contains 'aarch64' but current architecture is '${arch}' (expected aarch64)."
+  fi
+}
+
 default_target_image() {
   local image="$1"
   local suffix="$2"
@@ -168,6 +182,10 @@ patch_dir="${engine_dir}/${patch_version}"
 
 if [[ -z "$target_image" ]]; then
   target_image="$(default_target_image "$base_image" "$suffix" "$(date +%Y%m%d%H%M%S)")"
+fi
+
+if [[ -n "$save_file" ]]; then
+  validate_arch "$save_file"
 fi
 
 container_cli="${CONTAINER_CLI:-}"
