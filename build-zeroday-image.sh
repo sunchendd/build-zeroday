@@ -15,14 +15,25 @@ Patch mode (optional):
                               Required unless --skip-patch is set.
 
 Naming (auto-generates output filename):
-      --hardware HW           Hardware name, e.g. RTXPRO5000, H20, 800I_A3
-      --model MODEL           Model name, e.g. glm5.2, deepseekv4flash
-      --arch ARCH             Architecture: amd64 or aarch64 (default: auto-detect)
+      --hardware HW           Hardware/CUDA: A3, cu130, H20, RTXPRO5000
+      --model MODEL           Model name: glm5.2, deepseekv4flash (model-specific image)
+      --arch ARCH             Architecture: x86_64 or aarch64 (default: auto-detect)
       --output-dir DIR        Output directory (default: /nfs1/images_official)
       --prefix PREFIX         Filename prefix (default: Wings)
 
-Output filename format:
-  {prefix}_{engine}_{version}_{hardware}_{model}_{arch}.tar
+Output naming convention:
+  Model-specific       (--model + --hardware)
+    image:  wings_{engine}:{model}-{hardware}-{ts}
+    tar:    Wings_{engine}_{model}_{hardware}_{ts}_{arch}.tar
+  GPU release          (--hardware, no --model, engine=vllm)
+    image:  wings_{engine}:{version}-{hardware}-{ts}
+    tar:    Wings_{engine}_{version}_{hardware}_{ts}_{arch}.tar
+  Ascend release       (--hardware, no --model, engine=vllm-ascend)
+    image:  wings_{engine}:{version}-{hardware}-{ts}
+    tar:    Wings_{engine}_{version}_{ts}_{arch}.tar
+  Generic              (no --hardware, no --model)
+    image:  wings_{engine}:{version}-{ts}
+    tar:    Wings_{engine}_{version}_{ts}_{arch}.tar
 
 Other options:
   -o, --output-tar FILE      Save to explicit tar path (overrides auto-naming)
@@ -37,20 +48,30 @@ Other options:
   -h, --help                 Show this help
 
 Examples:
+  # Model-specific
+  ./build-zeroday-image.sh \
+    -b quay.io/ascend/vllm-ascend:v0.21.0rc1 \
+    -e vllm-ascend \
+    --hardware a3 --model glm5.2
+
+  # GPU general release
+  ./build-zeroday-image.sh \
+    -b vllm/vllm-openai:v0.23.0 \
+    -e vllm \
+    --hardware cu130
+
+  # Ascend general release
+  ./build-zeroday-image.sh \
+    -b quay.io/ascend/vllm-ascend:v0.21.0rc1 \
+    -e vllm-ascend \
+    --hardware A3
+
   # With patches
   ./build-zeroday-image.sh \
     -b vllm/vllm-openai:v0.22.0 \
     -e vllm \
     -v v0.22.0 \
-    --hardware H20 \
-    --model deepseekv4flash
-
-  # Without patches (engine-requirements only)
-  ./build-zeroday-image.sh \
-    -b vllm/vllm-openai:v0.23.0 \
-    -e vllm \
-    --hardware RTXPRO5000 \
-    --model glm5.2
+    --hardware H20 --model deepseekv4flash
 EOF
 }
 
@@ -77,7 +98,7 @@ detect_arch() {
   local arch
   arch="$(uname -m)"
   case "$arch" in
-    x86_64)  printf 'amd64' ;;
+    x86_64)  printf 'x86_64' ;;
     aarch64) printf 'aarch64' ;;
     *)       die "Unsupported architecture: ${arch}" ;;
   esac
@@ -88,7 +109,10 @@ validate_arch() {
   local current
   current="$(detect_arch)"
 
-  if [[ "$file" == *"amd64"* && "$current" != "amd64" ]]; then
+  if [[ "$file" == *"x86_64"* && "$current" != "x86_64" ]]; then
+    die "Output file name contains 'x86_64' but current arch is '${current}'."
+  fi
+  if [[ "$file" == *"amd64"* && "$current" != "x86_64" ]]; then
     die "Output file name contains 'amd64' but current arch is '${current}'."
   fi
   if [[ "$file" == *"aarch64"* && "$current" != "aarch64" ]]; then
@@ -98,27 +122,28 @@ validate_arch() {
 
 default_target_image() {
   local image="$1"
-  local suffix="$2"
-  local timestamp="$3"
+  local engine="$2"
+  local version="$3"
+  local model="$4"
+  local hardware="$5"
+  local suffix="$6"
+  local timestamp="$7"
 
   if [[ "$image" == *@sha256:* ]]; then
     die "Cannot derive a target tag from digest image '${image}'. Please pass --target-image."
   fi
 
-  # Extract image_name:tag from the full reference
-  # e.g. vllm/vllm-openai:v0.23.0 -> vllm-openai:v0.23.0
-  local last_part="${image##*/}"
-  local image_name="${last_part%%:*}"
-  local tag="${last_part##*:}"
+  local engine_tag="${engine//-/_}"   # vllm-ascend -> vllm_ascend
 
-  if [[ "$tag" == "$image_name" ]]; then
-    die "Cannot extract tag from image '${image}'."
-  fi
-
-  if [[ -n "$suffix" ]]; then
-    printf 'wings-%s:%s-%s-%s' "$image_name" "$tag" "$suffix" "$timestamp"
+  if [[ -n "$model" && -n "$hardware" ]]; then
+    # Model-specific: wings_{engine}:{model}-{hardware}-{timestamp}
+    printf 'wings_%s:%s-%s-%s' "$engine_tag" "$model" "$hardware" "$timestamp"
+  elif [[ -n "$hardware" ]]; then
+    # General release with hardware: wings_{engine}:{version}-{hardware}-{timestamp}
+    printf 'wings_%s:%s-%s-%s' "$engine_tag" "$version" "$hardware" "$timestamp"
   else
-    printf 'wings-%s:%s-%s' "$image_name" "$tag" "$timestamp"
+    # Generic: wings_{engine}:{version}-{timestamp}
+    printf 'wings_%s:%s-%s' "$engine_tag" "$version" "$timestamp"
   fi
 }
 
@@ -130,14 +155,25 @@ generate_output_name() {
   local model="$5"
   local arch="$6"
   local output_dir="$7"
+  local timestamp="$8"
 
   local engine_name="${engine//-/_}"
-  if [[ -n "$hardware" && -n "$model" ]]; then
+  if [[ -n "$model" && -n "$hardware" ]]; then
+    # Model-specific: Wings_{engine}_{model}_{hardware}_{timestamp}_{arch}.tar
     printf '%s/%s_%s_%s_%s_%s_%s.tar' \
-      "$output_dir" "$prefix" "$engine_name" "$version" "$hardware" "$model" "$arch"
+      "$output_dir" "$prefix" "$engine_name" "$model" "$hardware" "$timestamp" "$arch"
+  elif [[ -n "$hardware" && "$engine" == "vllm" ]]; then
+    # GPU general release: Wings_{engine}_{version}_{hardware}_{timestamp}_{arch}.tar
+    printf '%s/%s_%s_%s_%s_%s_%s.tar' \
+      "$output_dir" "$prefix" "$engine_name" "$version" "$hardware" "$timestamp" "$arch"
+  elif [[ -n "$hardware" ]]; then
+    # Ascend general release: Wings_{engine}_{version}_{timestamp}_{arch}.tar (no hardware)
+    printf '%s/%s_%s_%s_%s_%s.tar' \
+      "$output_dir" "$prefix" "$engine_name" "$version" "$timestamp" "$arch"
   else
-    printf '%s/%s_%s_%s_%s.tar' \
-      "$output_dir" "$prefix" "$engine_name" "$version" "$arch"
+    # Generic: Wings_{engine}_{version}_{timestamp}_{arch}.tar
+    printf '%s/%s_%s_%s_%s_%s.tar' \
+      "$output_dir" "$prefix" "$engine_name" "$version" "$timestamp" "$arch"
   fi
 }
 
@@ -307,14 +343,20 @@ else
 fi
 
 # ──────────────────────────────────────────────
+# Extract version & timestamp (used by naming)
+# ──────────────────────────────────────────────
+
+version="$(extract_image_tag "$base_image")"
+build_ts="$(date +%Y%m%d%H%M%S)"
+
+# ──────────────────────────────────────────────
 # Auto-generate output filename
 # ──────────────────────────────────────────────
 
 if [[ -z "$save_file" ]]; then
-  version="$(extract_image_tag "$base_image")"
   [[ -z "$arch" ]] && arch="$(detect_arch)"
   mkdir -p "$output_dir"
-  save_file="$(generate_output_name "$prefix" "$engine" "$version" "$hardware" "$model" "$arch" "$output_dir")"
+  save_file="$(generate_output_name "$prefix" "$engine" "$version" "$hardware" "$model" "$arch" "$output_dir" "$build_ts")"
   echo "Auto-generated output: ${save_file}"
 fi
 
@@ -327,7 +369,7 @@ fi
 # ──────────────────────────────────────────────
 
 if [[ -z "$target_image" ]]; then
-  target_image="$(default_target_image "$base_image" "$suffix" "$(date +%Y%m%d%H%M%S)")"
+  target_image="$(default_target_image "$base_image" "$engine" "$version" "$model" "$hardware" "$suffix" "$build_ts")"
 fi
 
 # ──────────────────────────────────────────────

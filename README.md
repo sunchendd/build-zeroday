@@ -5,73 +5,80 @@ Patch and package vLLM / vLLM Ascend Docker images with engine-level deps.
 ## Invocation
 
 ```
-./build-zeroday-image.sh -b IMAGE -e ENGINE [-v VER] [--hardware HW] [--model MODEL] [flags]
+./build-zeroday-image.sh -b IMAGE -e ENGINE [--hardware HW] [--model MODEL] [flags]
 ```
 
 ### Required
 
 | Arg | Values |
 |-----|--------|
-| `-b, --base-image` | any Docker image with a tag, e.g. `vllm/vllm-openai:v0.23.0` |
+| `-b, --base-image` | any Docker image with a tag |
 | `-e, --engine` | `vllm` or `vllm-ascend` |
 
-### Patch control
+### Naming
 
-| Arg | Default | Effect |
-|-----|---------|--------|
-| `-v, --patch-version` | — | version dir under `vllm-zeroday/` or `vllm-ascend-zeroday/`; **required unless `--skip-patch`** |
-| `--skip-patch` | false | skip `apply-patch.sh`, `apt-packages.txt`, `requirements.txt`; install only engine-requirements |
-| `--patch-script` | `apply-patch.sh` | script name inside the patch version dir |
+| Arg | Default |
+|-----|---------|
+| `--hardware` | — `cu130`, `A3`, `H20`, `RTXPRO5000` |
+| `--model` | — model-specific image (`glm5.2`, `deepseekv4flash`) |
+| `--arch` | auto (`uname -m` → `x86_64` / `aarch64`) |
+| `--prefix` | `Wings` |
+| `--output-dir` | `/nfs1/images_official` |
+| `-o` | override auto-naming |
 
-### Output naming
+**Naming rules:**
 
-| Arg | Default | Effect |
-|-----|---------|--------|
-| `--hardware` | — | e.g. `RTXPRO5000`, `H20`, `800I_A3` |
-| `--model` | — | e.g. `glm5.2`, `deepseekv4flash` |
-| `--arch` | auto (`uname -m`) | `amd64` or `aarch64` |
-| `--prefix` | `Wings` | filename prefix |
-| `--output-dir` | `/nfs1/images_official` | output directory |
-| `-o, --output-tar` | auto-generated | full path, overrides auto-naming |
+| Mode | Image tag | Tar file |
+|------|-----------|----------|
+| Model-specific `--model`+`--hardware` | `wings_{engine}:{model}-{hw}-{ts}` | `Wings_{engine}_{model}_{hw}_{ts}_{arch}.tar` |
+| GPU release `--hardware`, engine=vllm | `wings_{engine}:{ver}-{hw}-{ts}` | `Wings_{engine}_{ver}_{hw}_{ts}_{arch}.tar` |
+| Ascend release `--hardware`, engine=vllm-ascend | `wings_{engine}:{ver}-{hw}-{ts}` | `Wings_{engine}_{ver}_{ts}_{arch}.tar` |
+| Generic | `wings_{engine}:{ver}-{ts}` | `Wings_{engine}_{ver}_{ts}_{arch}.tar` |
 
-**Auto-generated filename:**
+### Patch
 
-- With `--hardware` + `--model`: `{prefix}_{engine}_{version}_{hardware}_{model}_{arch}.tar`
-- Without: `{prefix}_{engine}_{version}_{arch}.tar`
-- `engine`: hyphens replaced with underscores (`vllm-ascend` → `vllm_ascend`)
-- `version`: extracted from the base image tag (everything after last `:`)
+| Arg | Effect |
+|-----|--------|
+| `-v, --patch-version` | version dir under `vllm-zeroday/` or `vllm-ascend-zeroday/` |
+| `--skip-patch` | skip patches, install engine-requirements only |
+| `--patch-script` | script name (default `apply-patch.sh`) |
 
 ### Other
 
 | Arg | Effect |
 |-----|--------|
-| `-t, --target-image` | Docker tag (default: `BASE_IMAGE-zeroday-TIMESTAMP`) |
-| `-s, --suffix` | tag suffix (default: `zeroday`) |
-| `-f, --dockerfile` | path (default: `./Dockerfile`) |
+| `-t, --target-image` | override image tag |
+| `-s, --suffix` | tag suffix (default: none) |
 | `--push` | push after build |
 | `--no-cache` | `docker build --no-cache` |
 
-## Common patterns
+## Output files
+
+| File | Content |
+|------|---------|
+| `{name}.tar` | Docker image archive |
+| `{name}.tar.manifest.json` | Metadata: base image, engine, patches, deps, image ID, md5, build time |
+| `{output_dir}/md5_checksums.txt` | Cumulative md5 records |
+
+## Examples
 
 ```bash
-# Generic image (engine-requirements only, no patch)
+# Model-specific (ascend)
+./build-zeroday-image.sh -b quay.io/ascend/vllm-ascend:v0.21.0rc1 -e vllm-ascend \
+  --hardware a3 --model glm5.2
+
+# GPU general release
+./build-zeroday-image.sh -b vllm/vllm-openai:v0.23.0 -e vllm --hardware cu130
+
+# Ascend general release
+./build-zeroday-image.sh -b quay.io/ascend/vllm-ascend:v0.21.0rc1 -e vllm-ascend --hardware A3
+
+# Generic
 ./build-zeroday-image.sh -b vllm/vllm-openai:v0.23.0 -e vllm
 
-# With hardware/model naming
-./build-zeroday-image.sh -b vllm/vllm-openai:v0.23.0 -e vllm \
-  --hardware RTXPRO5000 --model glm5.2
-
-# With patches applied
+# With patches
 ./build-zeroday-image.sh -b vllm/vllm-openai:v0.22.0 -e vllm -v v0.22.0 \
   --hardware H20 --model deepseekv4flash
-
-# vllm-ascend with patches
-./build-zeroday-image.sh -b quay.io/ascend/vllm-ascend:v0.19.1rc1 -e vllm-ascend \
-  -v 0.19.1rc1 --hardware 800I_A3 --model glm5.1
-
-# Explicit output path
-./build-zeroday-image.sh -b vllm/vllm-openai:v0.23.0 -e vllm \
-  -o /nfs1/images_official/Wings_vllm_v0.23.0_amd64.tar
 ```
 
 ## engine-requirements
@@ -81,18 +88,9 @@ Patch and package vLLM / vLLM Ascend Docker images with engine-level deps.
 | `engine-requirements/vllm-zeroday.txt` | `-e vllm` |
 | `engine-requirements/vllm-ascend-zeroday.txt` | `-e vllm-ascend` |
 
-Dockerfile selects the correct file via the `ENGINE` build arg. Always installed regardless of patch mode.
-
 ## Submodules
 
 ```bash
 git submodule update --init --recursive
 git submodule update --remote --merge vllm-ascend-zeroday vllm-zeroday
 ```
-
-Directories:
-
-| Dir | Engine |
-|-----|--------|
-| `vllm-zeroday/` | `-e vllm` |
-| `vllm-ascend-zeroday/` | `-e vllm-ascend` |
