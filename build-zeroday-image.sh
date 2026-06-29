@@ -15,7 +15,8 @@ Patch mode (optional):
                               Required unless --skip-patch is set.
 
 Naming (auto-generates output filename):
-      --hardware HW           Hardware/CUDA: A3, cu130, H20, RTXPRO5000
+      --hardware HW           Hardware/CUDA: a3, cu130, h20 (auto-lowercased)
+                               GPU (vllm): auto-detects CUDA version if omitted
       --model MODEL           Model name: glm5.2, deepseekv4flash (model-specific image)
       --arch ARCH             Architecture: amd64 or aarch64 (default: auto-detect)
       --output-dir DIR        Output directory (default: /nfs1/images_official)
@@ -102,6 +103,26 @@ detect_arch() {
     aarch64) printf 'aarch64' ;;
     *)       die "Unsupported architecture: ${arch}" ;;
   esac
+}
+
+detect_cuda_version() {
+  local image="$1"
+  local cuda_ver
+
+  # Try CUDA_VERSION or NV_CUDA_VERSION env vars from image metadata (no container start)
+  cuda_ver="$("$container_cli" inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$image" 2>/dev/null | grep -i '^CUDA_VERSION=' | head -1 | cut -d= -f2)"
+  if [[ -z "$cuda_ver" ]]; then
+    cuda_ver="$("$container_cli" inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$image" 2>/dev/null | grep -i '^NV_CUDA_VERSION=' | head -1 | cut -d= -f2)"
+  fi
+
+  if [[ -n "$cuda_ver" ]]; then
+    # "13.0.123" -> "cu130"
+    local major_minor
+    major_minor="$(echo "$cuda_ver" | cut -d. -f1-2 | tr -d '.')"
+    printf 'cu%s' "$major_minor"
+  else
+    die "Cannot detect CUDA version from image '${image}'. Specify --hardware manually."
+  fi
 }
 
 validate_arch() {
@@ -253,7 +274,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     --hardware)
       [[ $# -ge 2 ]] || die "$1 requires a value"
-      hardware="$2"
+      hardware="${2,,}"
       shift 2
       ;;
     --model)
@@ -336,6 +357,30 @@ else
 fi
 
 # ──────────────────────────────────────────────
+# Container CLI
+# ──────────────────────────────────────────────
+
+container_cli="${CONTAINER_CLI:-}"
+if [[ -z "$container_cli" ]]; then
+  if command -v docker >/dev/null 2>&1; then
+    container_cli="docker"
+  elif command -v podman >/dev/null 2>&1; then
+    container_cli="podman"
+  else
+    die "Neither docker nor podman is available. Set CONTAINER_CLI to your container CLI."
+  fi
+fi
+
+# ──────────────────────────────────────────────
+# Auto-detect CUDA for GPU images
+# ──────────────────────────────────────────────
+
+if [[ "$engine" == "vllm" && -z "$hardware" && -z "$model" ]]; then
+  hardware="$(detect_cuda_version "$base_image")"
+  echo "Auto-detected CUDA: ${hardware}"
+fi
+
+# ──────────────────────────────────────────────
 # Extract version & timestamp (used by naming)
 # ──────────────────────────────────────────────
 
@@ -363,21 +408,6 @@ fi
 
 if [[ -z "$target_image" ]]; then
   target_image="$(default_target_image "$base_image" "$engine" "$version" "$model" "$hardware" "$suffix" "$build_ts")"
-fi
-
-# ──────────────────────────────────────────────
-# Container CLI
-# ──────────────────────────────────────────────
-
-container_cli="${CONTAINER_CLI:-}"
-if [[ -z "$container_cli" ]]; then
-  if command -v docker >/dev/null 2>&1; then
-    container_cli="docker"
-  elif command -v podman >/dev/null 2>&1; then
-    container_cli="podman"
-  else
-    die "Neither docker nor podman is available. Set CONTAINER_CLI to your container CLI."
-  fi
 fi
 
 # ──────────────────────────────────────────────
