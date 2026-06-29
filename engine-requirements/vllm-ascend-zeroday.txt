@@ -1,0 +1,5 @@
+# Engine-level Python requirements installed into EVERY vllm-ascend zeroday image,
+# regardless of version. Maintained in this repo (not in the vllm-ascend-zeroday submodule).
+# The shared Dockerfile auto-selects this file from the engine derived via PATCH_DIR.
+ray[cgraph]
+mooncake-transfer-engine

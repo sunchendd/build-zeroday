@@ -1,0 +1,4 @@
+# Engine-level Python requirements installed into EVERY vllm (GPU) zeroday image,
+# regardless of version. Maintained in this repo (not in the vllm-zeroday submodule).
+# The shared Dockerfile auto-selects this file from the engine derived via PATCH_DIR.
+ray[cgraph]

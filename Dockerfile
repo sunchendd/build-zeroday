@@ -9,12 +9,25 @@ ENV PIP_INDEX_URL=${PIP_INDEX_URL}
 
 COPY vllm-ascend-zeroday /root/build-zeroday/vllm-ascend-zeroday
 COPY vllm-zeroday /root/build-zeroday/vllm-zeroday
+# Engine-level Python requirements (ray[cgraph] / mooncake-transfer-engine, ...),
+# maintained in this repo and installed for every version of each engine.
+COPY engine-requirements /root/build-zeroday/engine-requirements
 
 RUN set -eux; \
     patch_dir="/root/build-zeroday/${PATCH_DIR}"; \
     if [ ! -d "${patch_dir}" ]; then \
       echo "Patch directory not found: ${patch_dir}" >&2; \
       exit 1; \
+    fi; \
+    engine_dir="${PATCH_DIR%/*}"; \
+    engine_req="/root/build-zeroday/engine-requirements/${engine_dir##*/}.txt"; \
+    if [ -f "${engine_req}" ]; then \
+      if ! command -v python3 >/dev/null 2>&1; then \
+        echo "Engine requirements file exists but python3 is not available in the base image" >&2; \
+        exit 1; \
+      fi; \
+      echo "Installing engine requirements from ${engine_req}"; \
+      python3 -m pip install --no-cache-dir -r "${engine_req}"; \
     fi; \
     if [ -f "${patch_dir}/apt-packages.txt" ]; then \
       if ! command -v apt-get >/dev/null 2>&1; then \
