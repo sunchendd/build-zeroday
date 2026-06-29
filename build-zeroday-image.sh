@@ -17,7 +17,7 @@ Patch mode (optional):
 Naming (auto-generates output filename):
       --hardware HW           Hardware/CUDA: A3, cu130, H20, RTXPRO5000
       --model MODEL           Model name: glm5.2, deepseekv4flash (model-specific image)
-      --arch ARCH             Architecture: x86_64 or aarch64 (default: auto-detect)
+      --arch ARCH             Architecture: amd64 or aarch64 (default: auto-detect)
       --output-dir DIR        Output directory (default: /nfs1/images_official)
       --prefix PREFIX         Filename prefix (default: Wings)
 
@@ -98,7 +98,7 @@ detect_arch() {
   local arch
   arch="$(uname -m)"
   case "$arch" in
-    x86_64)  printf 'x86_64' ;;
+    x86_64)  printf 'amd64' ;;
     aarch64) printf 'aarch64' ;;
     *)       die "Unsupported architecture: ${arch}" ;;
   esac
@@ -109,10 +109,7 @@ validate_arch() {
   local current
   current="$(detect_arch)"
 
-  if [[ "$file" == *"x86_64"* && "$current" != "x86_64" ]]; then
-    die "Output file name contains 'x86_64' but current arch is '${current}'."
-  fi
-  if [[ "$file" == *"amd64"* && "$current" != "x86_64" ]]; then
+  if [[ "$file" == *"amd64"* && "$current" != "amd64" ]]; then
     die "Output file name contains 'amd64' but current arch is '${current}'."
   fi
   if [[ "$file" == *"aarch64"* && "$current" != "aarch64" ]]; then
@@ -162,14 +159,10 @@ generate_output_name() {
     # Model-specific: Wings_{engine}_{model}_{hardware}_{timestamp}_{arch}.tar
     printf '%s/%s_%s_%s_%s_%s_%s.tar' \
       "$output_dir" "$prefix" "$engine_name" "$model" "$hardware" "$timestamp" "$arch"
-  elif [[ -n "$hardware" && "$engine" == "vllm" ]]; then
-    # GPU general release: Wings_{engine}_{version}_{hardware}_{timestamp}_{arch}.tar
+  elif [[ -n "$hardware" ]]; then
+    # General release with hardware: Wings_{engine}_{version}_{hardware}_{timestamp}_{arch}.tar
     printf '%s/%s_%s_%s_%s_%s_%s.tar' \
       "$output_dir" "$prefix" "$engine_name" "$version" "$hardware" "$timestamp" "$arch"
-  elif [[ -n "$hardware" ]]; then
-    # Ascend general release: Wings_{engine}_{version}_{timestamp}_{arch}.tar (no hardware)
-    printf '%s/%s_%s_%s_%s_%s.tar' \
-      "$output_dir" "$prefix" "$engine_name" "$version" "$timestamp" "$arch"
   else
     # Generic: Wings_{engine}_{version}_{timestamp}_{arch}.tar
     printf '%s/%s_%s_%s_%s_%s.tar' \
