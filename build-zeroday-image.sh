@@ -29,7 +29,7 @@ Other options:
       --save FILE             Alias for --output-tar
   -t, --target-image IMAGE   Output image tag (default: auto-generated)
   -f, --dockerfile FILE      Dockerfile path (default: ./Dockerfile)
-  -s, --suffix SUFFIX        Tag suffix (default: zeroday)
+  -s, --suffix SUFFIX        Tag suffix (default: none)
       --patch-script FILE    Patch script name (default: apply-patch.sh)
       --skip-patch           Skip applying patches; only install engine-requirements
       --push                 Push the built image
@@ -105,11 +105,20 @@ default_target_image() {
     die "Cannot derive a target tag from digest image '${image}'. Please pass --target-image."
   fi
 
+  # Extract image_name:tag from the full reference
+  # e.g. vllm/vllm-openai:v0.23.0 -> vllm-openai:v0.23.0
   local last_part="${image##*/}"
-  if [[ "$last_part" == *:* ]]; then
-    printf '%s-%s-%s' "$image" "$suffix" "$timestamp"
+  local image_name="${last_part%%:*}"
+  local tag="${last_part##*:}"
+
+  if [[ "$tag" == "$image_name" ]]; then
+    die "Cannot extract tag from image '${image}'."
+  fi
+
+  if [[ -n "$suffix" ]]; then
+    printf 'wings-%s:%s-%s-%s' "$image_name" "$tag" "$suffix" "$timestamp"
   else
-    printf '%s:%s-%s' "$image" "$suffix" "$timestamp"
+    printf 'wings-%s:%s-%s' "$image_name" "$tag" "$timestamp"
   fi
 }
 
@@ -160,7 +169,7 @@ patch_version=""
 patch_dir=""
 patch_script="apply-patch.sh"
 dockerfile="${repo_root}/Dockerfile"
-suffix="zeroday"
+suffix=""
 save_file=""
 push_image=0
 no_cache=0
@@ -358,6 +367,13 @@ if [[ "$skip_patch" -eq 1 ]]; then
   build_args+=(--build-arg SKIP_PATCH=true)
 fi
 
+# ── Image labels ──
+build_args+=(--label "ai.wings.base-image=${base_image}")
+build_args+=(--label "ai.wings.engine=${engine}")
+build_args+=(--label "ai.wings.patch-version=${patch_version}")
+build_args+=(--label "ai.wings.skip-patch=$([[ "$skip_patch" -eq 1 ]] && echo 'true' || echo 'false')")
+build_args+=(--label "ai.wings.build-time=$(date -u +%Y-%m-%dT%H:%M:%SZ)")
+
 build_args+=("$repo_root")
 
 echo "Building ${target_image} from ${base_image}"
@@ -366,6 +382,53 @@ echo "Building ${target_image} from ${base_image}"
 if [[ -n "$save_file" ]]; then
   echo "Saving ${target_image} to ${save_file}"
   "$container_cli" save -o "$save_file" "$target_image"
+
+  # ── Metadata ──
+  manifest_file="${save_file}.manifest.json"
+  image_id="$("$container_cli" inspect --format='{{.Id}}' "$target_image")"
+  build_time="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  checksum="$(md5sum "$save_file" | awk '{print $1}')"
+
+  # Collect patch info
+  patches_json="[]"
+  if [[ "$skip_patch" -ne 1 && -d "${repo_root}/${patch_dir}" ]]; then
+    mapfile -t patch_files < <(find "${repo_root}/${patch_dir}" -maxdepth 1 \( -name '*.patch' -o -name '*.diff' \) -printf '%f\n' 2>/dev/null | sort)
+    if [[ ${#patch_files[@]} -gt 0 ]]; then
+      patches_json="["
+      for p in "${patch_files[@]}"; do
+        patches_json+="\"$p\","
+      done
+      patches_json="${patches_json%,}]"
+    fi
+  fi
+
+  # Collect engine-requirements content
+  engine_req_file="${repo_root}/engine-requirements/${engine_dir}.txt"
+  engine_req_content=""
+  if [[ -f "$engine_req_file" ]]; then
+    engine_req_content="$(grep -v '^#' "$engine_req_file" | grep -v '^[[:space:]]*$' | tr '\n' ' ' | sed 's/ *$//')"
+  fi
+
+  cat > "$manifest_file" <<MANIFEST
+{
+  "output": "${save_file##*/}",
+  "image_id": "${image_id}",
+  "base_image": "${base_image}",
+  "engine": "${engine}",
+  "patch_version": "${patch_version}",
+  "patches": ${patches_json},
+  "skip_patch": $([[ "$skip_patch" -eq 1 ]] && echo "true" || echo "false"),
+  "engine_requirements": "${engine_req_content}",
+  "build_time": "${build_time}",
+  "md5": "${checksum}"
+}
+MANIFEST
+  echo "Metadata written to ${manifest_file}"
+
+  # ── Checksum record ──
+  checksum_file="${output_dir}/md5_checksums.txt"
+  echo "${checksum}  ${save_file##*/}" >> "$checksum_file"
+  echo "Checksum appended to ${checksum_file}"
 fi
 
 if [[ "$push_image" -eq 1 ]]; then

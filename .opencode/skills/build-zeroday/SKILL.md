@@ -82,6 +82,16 @@ Use `-o` to override the auto-generated path.
 | `--push` | Push image after build |
 | `--no-cache` | Build without Docker cache |
 
+## Output files
+
+Each build produces:
+
+| File | Content |
+|------|---------|
+| `{name}.tar` | Docker image archive |
+| `{name}.tar.manifest.json` | Metadata: base image, engine, patches, deps, image ID, md5, build time |
+| `{output_dir}/md5_checksums.txt` | Cumulative md5 records for all builds in the directory |
+
 ## Engine-requirements
 
 Engine-level pip dependencies are stored in `engine-requirements/`:
