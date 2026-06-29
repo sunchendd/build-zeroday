@@ -1,99 +1,98 @@
 # build-zeroday
-构建加速特性镜像脚本
 
-## 使用方式
+Patch and package vLLM / vLLM Ascend Docker images with engine-level deps.
 
-基于已有 vLLM/vLLM Ascend 镜像，把本仓库 submodule 中的补丁和依赖打进新镜像：
+## Invocation
 
-vllm-ascend 示例
-```bash
-./build-zeroday-image.sh \
-  -b quay.io/ascend/vllm-ascend:v0.19.1rc1 \
-  -e vllm-ascend \
-  -v v0.19.1rc1 \
-  -o Wings_vllm_ascend_v0.19.1rc1_800I_A3_glm5.1_aarch64.tar
 ```
-vllm 示例
-```bash
-./build-zeroday-image.sh \
-  -b swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/vllm/vllm-openai:v0.22.0 \
-  -e vllm \
-  -v v0.22.0 \
-  -o Wings_vllm_v0.22.0_H20_deepseekv4flash-amd64.tar
+./build-zeroday-image.sh -b IMAGE -e ENGINE [-v VER] [--hardware HW] [--model MODEL] [flags]
 ```
 
-`-o/--output-tar` 是导出的镜像包路径，等价于 `--save`。
+### Required
 
-`-e/--engine` 支持：
+| Arg | Values |
+|-----|--------|
+| `-b, --base-image` | any Docker image with a tag, e.g. `vllm/vllm-openai:v0.23.0` |
+| `-e, --engine` | `vllm` or `vllm-ascend` |
 
-- `vllm`：使用 `vllm-zeroday/<版本>`
-- `vllm-ascend` 或 `ascend`：使用 `vllm-ascend-zeroday/<版本>`
+### Patch control
 
-如果引擎不支持，或者对应版本目录不存在，脚本会直接报错退出。
+| Arg | Default | Effect |
+|-----|---------|--------|
+| `-v, --patch-version` | — | version dir under `vllm-zeroday/` or `vllm-ascend-zeroday/`; **required unless `--skip-patch`** |
+| `--skip-patch` | false | skip `apply-patch.sh`, `apt-packages.txt`, `requirements.txt`; install only engine-requirements |
+| `--patch-script` | `apply-patch.sh` | script name inside the patch version dir |
 
-脚本默认执行补丁目录下的 `apply-patch.sh`。如果补丁目录里存在以下文件，也会自动处理：
+### Output naming
 
-- `apt-packages.txt`：通过 `apt-get install` 安装系统依赖
-- `requirements.txt`：通过 `python3 -m pip install` 安装 Python 依赖
-- `install-deps.sh`：执行自定义依赖安装脚本
+| Arg | Default | Effect |
+|-----|---------|--------|
+| `--hardware` | — | e.g. `RTXPRO5000`, `H20`, `800I_A3` |
+| `--model` | — | e.g. `glm5.2`, `deepseekv4flash` |
+| `--arch` | auto (`uname -m`) | `amd64` or `aarch64` |
+| `--prefix` | `Wings` | filename prefix |
+| `--output-dir` | `/nfs1/images_official` | output directory |
+| `-o, --output-tar` | auto-generated | full path, overrides auto-naming |
 
-可用 `--patch-script` 指定其他补丁脚本，用 `--push` 在构建成功后推送镜像。
+**Auto-generated filename:**
 
-## Submodule 同步
+- With `--hardware` + `--model`: `{prefix}_{engine}_{version}_{hardware}_{model}_{arch}.tar`
+- Without: `{prefix}_{engine}_{version}_{arch}.tar`
+- `engine`: hyphens replaced with underscores (`vllm-ascend` → `vllm_ascend`)
+- `version`: extracted from the base image tag (everything after last `:`)
 
-`vllm-ascend-zeroday/` 和 `vllm-zeroday/` 是独立补丁仓库，在本仓库中以 submodule 方式引用。
+### Other
 
-首次拉取本仓库后初始化 submodule（若 submodule 有本地修改，以下命令会强制丢弃本地修改并同步到最新远端）：
+| Arg | Effect |
+|-----|--------|
+| `-t, --target-image` | Docker tag (default: `BASE_IMAGE-zeroday-TIMESTAMP`) |
+| `-s, --suffix` | tag suffix (default: `zeroday`) |
+| `-f, --dockerfile` | path (default: `./Dockerfile`) |
+| `--push` | push after build |
+| `--no-cache` | `docker build --no-cache` |
+
+## Common patterns
 
 ```bash
-git clone https://github.com/sunchendd/build-zeroday.git
-cd build-zeroday
-git submodule update --init
-git submodule foreach --recursive 'git fetch origin && git reset --hard origin/HEAD'
+# Generic image (engine-requirements only, no patch)
+./build-zeroday-image.sh -b vllm/vllm-openai:v0.23.0 -e vllm
+
+# With hardware/model naming
+./build-zeroday-image.sh -b vllm/vllm-openai:v0.23.0 -e vllm \
+  --hardware RTXPRO5000 --model glm5.2
+
+# With patches applied
+./build-zeroday-image.sh -b vllm/vllm-openai:v0.22.0 -e vllm -v v0.22.0 \
+  --hardware H20 --model deepseekv4flash
+
+# vllm-ascend with patches
+./build-zeroday-image.sh -b quay.io/ascend/vllm-ascend:v0.19.1rc1 -e vllm-ascend \
+  -v 0.19.1rc1 --hardware 800I_A3 --model glm5.1
+
+# Explicit output path
+./build-zeroday-image.sh -b vllm/vllm-openai:v0.23.0 -e vllm \
+  -o /nfs1/images_official/Wings_vllm_v0.23.0_amd64.tar
 ```
 
-如果 submodule 指针更新了，可以在主仓库提交新的指针：
+## engine-requirements
+
+| File | Engine |
+|------|--------|
+| `engine-requirements/vllm-zeroday.txt` | `-e vllm` |
+| `engine-requirements/vllm-ascend-zeroday.txt` | `-e vllm-ascend` |
+
+Dockerfile selects the correct file via the `ENGINE` build arg. Always installed regardless of patch mode.
+
+## Submodules
 
 ```bash
-git add vllm-ascend-zeroday vllm-zeroday
-git commit -m "chore(submodules): update zeroday patch refs"
-```
-## 镜像构建使用方式
-
-基于已有 vLLM/vLLM Ascend 镜像，把本仓库 submodule 中的补丁和依赖打进新镜像，导出镜像包：
-vllm-ascend示例
-```bash
-./build-zeroday-image.sh \
-  -b quay.io/ascend/vllm-ascend:v0.19.1rc1-a3 \
-  -e vllm-ascend \
-  -v 0.19.1rc1 \
-  -o Wings_vllm_ascend_v0.19.1rc1_800I_A3_glm5.1_aarch64.tar
+git submodule update --init --recursive
+git submodule update --remote --merge vllm-ascend-zeroday vllm-zeroday
 ```
 
-vllm示例
-```bash
-./build-zeroday-image.sh \
-  -b swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/vllm/vllm-openai:v0.22.0 \
-  -e vllm \
-  -v 0.22.0 \
-  -o Wings_vllm_v0.22.0_H20_deepseekv4flash-amd64.tar
-```
+Directories:
 
-`-o/--output-tar` 是导出的镜像包路径，等价于 `--save`。
-
-`-e/--engine` 支持：
-
-- `vllm`：使用 `vllm-zeroday/<版本>`
-- `vllm-ascend` 或 `ascend`：使用 `vllm-ascend-zeroday/<版本>`
-
-如果引擎不支持，或者对应版本目录不存在，脚本会直接报错退出。
-
-脚本默认执行补丁目录下的 `apply-patch.sh`。如果补丁目录里存在以下文件，也会自动处理：
-
-- `apt-packages.txt`：通过 `apt-get install` 安装系统依赖
-- `requirements.txt`：通过 `python3 -m pip install` 安装 Python 依赖
-- `install-deps.sh`：执行自定义依赖安装脚本
-
-可用 `--patch-script` 指定其他补丁脚本，用 `--push` 在构建成功后推送镜像。
-
-
+| Dir | Engine |
+|-----|--------|
+| `vllm-zeroday/` | `-e vllm` |
+| `vllm-ascend-zeroday/` | `-e vllm-ascend` |

@@ -4,36 +4,53 @@ set -Eeuo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  ./build-zeroday-image.sh -b BASE_IMAGE -e ENGINE -v PATCH_VERSION [-t TARGET_IMAGE] [-o OUTPUT_TAR] [options]
+  ./build-zeroday-image.sh -b BASE_IMAGE -e ENGINE [options]
 
 Required:
-  -b, --base-image IMAGE     Input/base image to patch, for example quay.io/ascend/vllm-ascend:v0.19.1rc1
-  -e, --engine ENGINE        Patch engine: vllm or vllm-ascend
-  -v, --patch-version VER    Patch version directory, for example 0.19.1rc1
+  -b, --base-image IMAGE     Input/base image, e.g. vllm/vllm-openai:v0.23.0
+  -e, --engine ENGINE        Engine: vllm or vllm-ascend
 
-Options:
-  -t, --target-image IMAGE   Output image tag after patching. Defaults to BASE_IMAGE with "-zeroday-YYYYmmddHHMMSS" appended to its tag.
-  -o, --output-tar FILE      Save the built image to a tar file
-  -f, --dockerfile FILE      Dockerfile path. Defaults to ./Dockerfile
-  -s, --suffix SUFFIX        Suffix used when TARGET_IMAGE is omitted. Defaults to zeroday
-      --patch-script FILE    Patch script name inside the resolved patch directory. Defaults to apply-patch.sh
-      --save FILE            Alias for --output-tar
-      --push                 Push the built image after successful build
+Patch mode (optional):
+  -v, --patch-version VER    Patch version directory, e.g. v0.22.0
+                              Required unless --skip-patch is set.
+
+Naming (auto-generates output filename):
+      --hardware HW           Hardware name, e.g. RTXPRO5000, H20, 800I_A3
+      --model MODEL           Model name, e.g. glm5.2, deepseekv4flash
+      --arch ARCH             Architecture: amd64 or aarch64 (default: auto-detect)
+      --output-dir DIR        Output directory (default: /nfs1/images_official)
+      --prefix PREFIX         Filename prefix (default: Wings)
+
+Output filename format:
+  {prefix}_{engine}_{version}_{hardware}_{model}_{arch}.tar
+
+Other options:
+  -o, --output-tar FILE      Save to explicit tar path (overrides auto-naming)
+      --save FILE             Alias for --output-tar
+  -t, --target-image IMAGE   Output image tag (default: auto-generated)
+  -f, --dockerfile FILE      Dockerfile path (default: ./Dockerfile)
+  -s, --suffix SUFFIX        Tag suffix (default: zeroday)
+      --patch-script FILE    Patch script name (default: apply-patch.sh)
+      --skip-patch           Skip applying patches; only install engine-requirements
+      --push                 Push the built image
       --no-cache             Build without cache
   -h, --help                 Show this help
 
 Examples:
+  # With patches
   ./build-zeroday-image.sh \
-    -b quay.io/ascend/vllm-ascend:v0.19.1rc1 \
-    -e vllm-ascend \
-    -v 0.19.1rc1 \
-    -t quay.io/ascend/vllm-ascend:v0.19.1rc1-a3
-
-  ./build-zeroday-image.sh \
-    -b swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/vllm/vllm-openai:v0.22.0 \
+    -b vllm/vllm-openai:v0.22.0 \
     -e vllm \
-    -v 0.22.0 \
-    -o vllm-openai-v0.22.0-zeroday.tar
+    -v v0.22.0 \
+    --hardware H20 \
+    --model deepseekv4flash
+
+  # Without patches (engine-requirements only)
+  ./build-zeroday-image.sh \
+    -b vllm/vllm-openai:v0.23.0 \
+    -e vllm \
+    --hardware RTXPRO5000 \
+    --model glm5.2
 EOF
 }
 
@@ -47,17 +64,35 @@ normalize_image() {
   printf '%s' "${image//：/:}"
 }
 
-validate_arch() {
-  local file="$1"
+extract_image_tag() {
+  local image="$1"
+  local tag="${image##*:}"
+  if [[ "$tag" == *@* || "$tag" == "$image" ]]; then
+    die "Cannot extract tag from image '${image}'. Please provide an image with a tag."
+  fi
+  printf '%s' "$tag"
+}
+
+detect_arch() {
   local arch
   arch="$(uname -m)"
+  case "$arch" in
+    x86_64)  printf 'amd64' ;;
+    aarch64) printf 'aarch64' ;;
+    *)       die "Unsupported architecture: ${arch}" ;;
+  esac
+}
 
-  if [[ "$file" == *"amd64"* && "$arch" != "x86_64" ]]; then
-    die "Output file name contains 'amd64' but current architecture is '${arch}' (expected x86_64)."
+validate_arch() {
+  local file="$1"
+  local current
+  current="$(detect_arch)"
+
+  if [[ "$file" == *"amd64"* && "$current" != "amd64" ]]; then
+    die "Output file name contains 'amd64' but current arch is '${current}'."
   fi
-
-  if [[ "$file" == *"aarch64"* && "$arch" != "aarch64" ]]; then
-    die "Output file name contains 'aarch64' but current architecture is '${arch}' (expected aarch64)."
+  if [[ "$file" == *"aarch64"* && "$current" != "aarch64" ]]; then
+    die "Output file name contains 'aarch64' but current arch is '${current}'."
   fi
 }
 
@@ -78,6 +113,25 @@ default_target_image() {
   fi
 }
 
+generate_output_name() {
+  local prefix="$1"
+  local engine="$2"
+  local version="$3"
+  local hardware="$4"
+  local model="$5"
+  local arch="$6"
+  local output_dir="$7"
+
+  local engine_name="${engine//-/_}"
+  if [[ -n "$hardware" && -n "$model" ]]; then
+    printf '%s/%s_%s_%s_%s_%s_%s.tar' \
+      "$output_dir" "$prefix" "$engine_name" "$version" "$hardware" "$model" "$arch"
+  else
+    printf '%s/%s_%s_%s_%s.tar' \
+      "$output_dir" "$prefix" "$engine_name" "$version" "$arch"
+  fi
+}
+
 resolve_engine_dir() {
   local engine="$1"
 
@@ -94,6 +148,10 @@ resolve_engine_dir() {
   esac
 }
 
+# ──────────────────────────────────────────────
+# Parse arguments
+# ──────────────────────────────────────────────
+
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 base_image=""
 target_image=""
@@ -106,6 +164,12 @@ suffix="zeroday"
 save_file=""
 push_image=0
 no_cache=0
+skip_patch=0
+hardware=""
+model=""
+arch=""
+output_dir="/nfs1/images_official"
+prefix="Wings"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -149,12 +213,44 @@ while [[ $# -gt 0 ]]; do
       save_file="$2"
       shift 2
       ;;
+    --hardware)
+      [[ $# -ge 2 ]] || die "$1 requires a value"
+      hardware="$2"
+      shift 2
+      ;;
+    --model)
+      [[ $# -ge 2 ]] || die "$1 requires a value"
+      model="$2"
+      shift 2
+      ;;
+    --arch)
+      [[ $# -ge 2 ]] || die "$1 requires a value"
+      case "$2" in
+        amd64|aarch64) arch="$2" ;;
+        *) die "Invalid arch '$2'. Supported: amd64, aarch64" ;;
+      esac
+      shift 2
+      ;;
+    --output-dir)
+      [[ $# -ge 2 ]] || die "$1 requires a value"
+      output_dir="$2"
+      shift 2
+      ;;
+    --prefix)
+      [[ $# -ge 2 ]] || die "$1 requires a value"
+      prefix="$2"
+      shift 2
+      ;;
     --push)
       push_image=1
       shift
       ;;
     --no-cache)
       no_cache=1
+      shift
+      ;;
+    --skip-patch)
+      skip_patch=1
       shift
       ;;
     -h|--help)
@@ -167,26 +263,67 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# ──────────────────────────────────────────────
+# Validation
+# ──────────────────────────────────────────────
+
 [[ -n "$base_image" ]] || die "Missing --base-image"
 [[ -n "$engine" ]] || die "Missing --engine"
-[[ -n "$patch_version" ]] || die "Missing --patch-version"
-[[ "$patch_version" != *"/"* && "$patch_version" != *".."* ]] || die "Patch version must be a version directory name, not a path: $patch_version"
 [[ -f "$dockerfile" ]] || die "Dockerfile not found: $dockerfile"
 
+# When --skip-patch, patch directory is not strictly needed
+# But if -v IS given, use it for the build context (some deps may still be installed)
 engine_dir="$(resolve_engine_dir "$engine")"
-[[ -d "${repo_root}/${engine_dir}" ]] || die "Patch engine directory not found: ${repo_root}/${engine_dir}"
+if [[ "$skip_patch" -eq 1 ]]; then
+  # --skip-patch: -v is optional. If not given, use a dummy value (PATCH_DIR in
+  # Dockerfile is only used inside the non-SKIP_PATCH branch anyway).
+  if [[ -z "$patch_version" ]]; then
+    patch_version="_skip"
+    patch_dir="${engine_dir}/_skip"
+  else
+    patch_dir="${engine_dir}/${patch_version}"
+  fi
+else
+  # Patch mode: -v is required and must point to a valid directory with a patch script
+  [[ -n "$patch_version" ]] || die "Missing --patch-version (required unless --skip-patch)"
+  [[ "$patch_version" != *"/"* && "$patch_version" != *".."* ]] || \
+    die "Patch version must be a version directory name, not a path: $patch_version"
+  [[ -d "${repo_root}/${engine_dir}" ]] || \
+    die "Patch engine directory not found: ${repo_root}/${engine_dir}"
+  patch_dir="${engine_dir}/${patch_version}"
+  [[ -d "${repo_root}/${patch_dir}" ]] || \
+    die "Patch version directory not found: ${repo_root}/${patch_dir}"
+  [[ -f "${repo_root}/${patch_dir}/${patch_script}" ]] || \
+    die "Patch script not found: ${repo_root}/${patch_dir}/${patch_script}"
+fi
 
-patch_dir="${engine_dir}/${patch_version}"
-[[ -d "${repo_root}/${patch_dir}" ]] || die "Patch version directory not found: ${repo_root}/${patch_dir}"
-[[ -f "${repo_root}/${patch_dir}/${patch_script}" ]] || die "Patch script not found: ${repo_root}/${patch_dir}/${patch_script}"
+# ──────────────────────────────────────────────
+# Auto-generate output filename
+# ──────────────────────────────────────────────
 
-if [[ -z "$target_image" ]]; then
-  target_image="$(default_target_image "$base_image" "$suffix" "$(date +%Y%m%d%H%M%S)")"
+if [[ -z "$save_file" ]]; then
+  version="$(extract_image_tag "$base_image")"
+  [[ -z "$arch" ]] && arch="$(detect_arch)"
+  mkdir -p "$output_dir"
+  save_file="$(generate_output_name "$prefix" "$engine" "$version" "$hardware" "$model" "$arch" "$output_dir")"
+  echo "Auto-generated output: ${save_file}"
 fi
 
 if [[ -n "$save_file" ]]; then
   validate_arch "$save_file"
 fi
+
+# ──────────────────────────────────────────────
+# Target image tag
+# ──────────────────────────────────────────────
+
+if [[ -z "$target_image" ]]; then
+  target_image="$(default_target_image "$base_image" "$suffix" "$(date +%Y%m%d%H%M%S)")"
+fi
+
+# ──────────────────────────────────────────────
+# Container CLI
+# ──────────────────────────────────────────────
 
 container_cli="${CONTAINER_CLI:-}"
 if [[ -z "$container_cli" ]]; then
@@ -199,10 +336,15 @@ if [[ -z "$container_cli" ]]; then
   fi
 fi
 
+# ──────────────────────────────────────────────
+# Build
+# ──────────────────────────────────────────────
+
 build_args=(
   build
   -f "$dockerfile"
   --build-arg "BASE_IMAGE=$base_image"
+  --build-arg "ENGINE=$engine_dir"
   --build-arg "PATCH_DIR=$patch_dir"
   --build-arg "PATCH_SCRIPT=$patch_script"
   -t "$target_image"
@@ -212,9 +354,13 @@ if [[ "$no_cache" -eq 1 ]]; then
   build_args+=(--no-cache)
 fi
 
+if [[ "$skip_patch" -eq 1 ]]; then
+  build_args+=(--build-arg SKIP_PATCH=true)
+fi
+
 build_args+=("$repo_root")
 
-echo "Building ${target_image} from ${base_image} with ${patch_dir}/${patch_script}"
+echo "Building ${target_image} from ${base_image}"
 "$container_cli" "${build_args[@]}"
 
 if [[ -n "$save_file" ]]; then
