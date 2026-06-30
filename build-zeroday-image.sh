@@ -18,7 +18,7 @@ Naming (auto-generates output filename):
       --hardware HW           Hardware/CUDA: a3, cu130, h20 (auto-lowercased)
                                GPU (vllm): auto-detects CUDA version if omitted
       --model MODEL           Model name: glm5.2, deepseekv4flash (model-specific image)
-      --arch ARCH             Architecture: amd64 or aarch64 (default: auto-detect)
+      --arch ARCH             Architecture: x86_64 or aarch64 (default: auto-detect)
       --output-dir DIR        Output directory (default: /nfs1/images_official)
       --prefix PREFIX         Filename prefix (default: Wings)
 
@@ -99,7 +99,7 @@ detect_arch() {
   local arch
   arch="$(uname -m)"
   case "$arch" in
-    x86_64)  printf 'amd64' ;;
+    x86_64)  printf 'x86_64' ;;
     aarch64) printf 'aarch64' ;;
     *)       die "Unsupported architecture: ${arch}" ;;
   esac
@@ -130,8 +130,8 @@ validate_arch() {
   local current
   current="$(detect_arch)"
 
-  if [[ "$file" == *"amd64"* && "$current" != "amd64" ]]; then
-    die "Output file name contains 'amd64' but current arch is '${current}'."
+  if [[ "$file" == *"x86_64"* && "$current" != "x86_64" ]]; then
+    die "Output file name contains 'x86_64' but current arch is '${current}'."
   fi
   if [[ "$file" == *"aarch64"* && "$current" != "aarch64" ]]; then
     die "Output file name contains 'aarch64' but current arch is '${current}'."
@@ -285,8 +285,8 @@ while [[ $# -gt 0 ]]; do
     --arch)
       [[ $# -ge 2 ]] || die "$1 requires a value"
       case "$2" in
-        amd64|aarch64) arch="$2" ;;
-        *) die "Invalid arch '$2'. Supported: amd64, aarch64" ;;
+        x86_64|aarch64) arch="$2" ;;
+        *) die "Invalid arch '$2'. Supported: x86_64, aarch64" ;;
       esac
       shift 2
       ;;

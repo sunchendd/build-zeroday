@@ -56,7 +56,7 @@ The script runs `build-zeroday-image.sh` from `/home/scd/build-zeroday/`.
 |-----|-------------|
 | `--hardware` | Hardware name, e.g. `RTXPRO5000`, `H20`, `800I_A3` |
 | `--model` | Model name, e.g. `glm5.2`, `deepseekv4flash` |
-| `--arch` | Architecture: `amd64` or `aarch64` (default: auto-detect from `uname -m`) |
+| `--arch` | Architecture: `x86_64` or `aarch64` (default: auto-detect from `uname -m`) |
 | `--output-dir` | Output directory (default: `/nfs1/images_official`) |
 | `--prefix` | Filename prefix (default: `Wings`) |
 
@@ -67,8 +67,8 @@ With hardware + model: `{prefix}_{engine}_{version}_{hardware}_{model}_{arch}.ta
 Generic (no hardware/model): `{prefix}_{engine}_{version}_{arch}.tar`
 
 Examples:
-- `Wings_vllm_v0.23.0_RTXPRO5000_glm5.2_amd64.tar`
-- `Wings_vllm_v0.23.0_amd64.tar`
+- `Wings_vllm_v0.23.0_RTXPRO5000_glm5.2_x86_64.tar`
+- `Wings_vllm_v0.23.0_x86_64.tar`
 - `Wings_vllm_ascend_v0.19.1rc1_800I_A3_glm5.1_aarch64.tar`
 
 Use `-o` to override the auto-generated path.
