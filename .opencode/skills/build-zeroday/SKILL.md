@@ -1,6 +1,6 @@
 ---
 name: build-zeroday
-description: Use when the user asks to build, package, or create Docker images based on vllm/vllm-openai or ascend/vllm-ascend base images. Handles building zeroday images with engine-requirements and optional patches, then exporting as tar files to /nfs1/images_official/.
+description: Use when the user asks to build, package, or create Docker images based on vllm/vllm-openai or ascend/vllm-ascend base images. Handles building zeroday images with engine-requirements and optional patches, then exporting as tar files to /os_nfs/06_images/.
 ---
 
 # Build Zeroday Image
@@ -57,7 +57,7 @@ The script runs `build-zeroday-image.sh` from `/home/scd/build-zeroday/`.
 | `--hardware` | Hardware name, e.g. `RTXPRO5000`, `H20`, `800I_A3` |
 | `--model` | Model name, e.g. `glm5.2`, `deepseekv4flash` |
 | `--arch` | Architecture: `x86_64` or `aarch64` (default: auto-detect from `uname -m`) |
-| `--output-dir` | Output directory (default: `/nfs1/images_official`) |
+| `--output-dir` | Output directory (default: `/os_nfs/06_images`) |
 | `--prefix` | Filename prefix (default: `Wings`) |
 
 ### Output naming convention

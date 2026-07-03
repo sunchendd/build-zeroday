@@ -19,7 +19,7 @@ Naming (auto-generates output filename):
                                GPU (vllm): auto-detects CUDA version if omitted
       --model MODEL           Model name: glm5.2, deepseekv4flash (model-specific image)
       --arch ARCH             Architecture: x86_64 or aarch64 (default: auto-detect)
-      --output-dir DIR        Output directory (default: /nfs1/images_official)
+      --output-dir DIR        Output directory (default: /os_nfs/06_images)
       --prefix PREFIX         Filename prefix (default: Wings)
 
 Output naming convention:
@@ -227,7 +227,7 @@ skip_patch=0
 hardware=""
 model=""
 arch=""
-output_dir="/nfs1/images_official"
+output_dir="/os_nfs/06_images"
 prefix="Wings"
 
 while [[ $# -gt 0 ]]; do

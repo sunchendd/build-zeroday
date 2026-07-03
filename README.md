@@ -23,7 +23,7 @@ Patch and package vLLM / vLLM Ascend Docker images with engine-level deps.
 | `--model` | — model-specific image (`glm5.2`, `deepseekv4flash`) |
 | `--arch` | auto (`uname -m` → `x86_64` / `aarch64`) |
 | `--prefix` | `Wings` |
-| `--output-dir` | `/nfs1/images_official` |
+| `--output-dir` | `/os_nfs/06_images` |
 | `-o` | override auto-naming |
 
 **Naming rules:**
