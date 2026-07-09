@@ -4,11 +4,13 @@ FROM ${BASE_IMAGE}
 
 ARG ENGINE
 ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+ARG PIP_TRUSTED_HOST=
 ARG PATCH_DIR
 ARG PATCH_SCRIPT=apply-patch.sh
 ARG SKIP_PATCH
 
 ENV PIP_INDEX_URL=${PIP_INDEX_URL}
+ENV PIP_TRUSTED_HOST=${PIP_TRUSTED_HOST}
 
 COPY vllm-ascend-zeroday /root/build-zeroday/vllm-ascend-zeroday
 COPY vllm-zeroday /root/build-zeroday/vllm-zeroday

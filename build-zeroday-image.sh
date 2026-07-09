@@ -441,6 +441,14 @@ build_args+=(--label "ai.wings.build-time=$(date -u +%Y-%m-%dT%H:%M:%SZ)")
 
 build_args+=("$repo_root")
 
+# Allow overriding the pip mirror per-host (e.g. isolated hosts using an internal mirror)
+if [[ -n "${PIP_INDEX_URL:-}" ]]; then
+  build_args+=(--build-arg "PIP_INDEX_URL=${PIP_INDEX_URL}")
+fi
+if [[ -n "${PIP_TRUSTED_HOST:-}" ]]; then
+  build_args+=(--build-arg "PIP_TRUSTED_HOST=${PIP_TRUSTED_HOST}")
+fi
+
 echo "Building ${target_image} from ${base_image}"
 "$container_cli" "${build_args[@]}"
 
