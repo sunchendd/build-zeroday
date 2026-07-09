@@ -2,3 +2,4 @@
 # regardless of version. Maintained in this repo (not in the vllm-zeroday submodule).
 # The shared Dockerfile auto-selects this file from the engine derived via PATCH_DIR.
 ray
+arctic-inference==0.1.1
