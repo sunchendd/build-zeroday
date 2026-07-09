@@ -22,19 +22,19 @@ Naming (auto-generates output filename):
       --output-dir DIR        Output directory (default: /os_nfs/06_images)
       --prefix PREFIX         Filename prefix (default: Wings)
 
-Output naming convention:
+Output naming convention (filename: hyphens -> underscores, saved as .tgz via pigz):
   Model-specific       (--model + --hardware)
     image:  wings_{engine}:{model}-{hardware}-{ts}
-    tar:    Wings_{engine}_{model}_{hardware}_{ts}_{arch}.tar
+    tgz:    Wings_{engine}_{model}_{hardware}_{ts}_{arch}.tgz
   GPU release          (--hardware, no --model, engine=vllm)
     image:  wings_{engine}:{version}-{hardware}-{ts}
-    tar:    Wings_{engine}_{version}_{hardware}_{ts}_{arch}.tar
+    tgz:    Wings_{engine}_{version}_{hardware}_{ts}_{arch}.tgz
   Ascend release       (--hardware, no --model, engine=vllm-ascend)
     image:  wings_{engine}:{version}-{hardware}-{ts}
-    tar:    Wings_{engine}_{version}_{ts}_{arch}.tar
+    tgz:    Wings_{engine}_{version}_{ts}_{arch}.tgz
   Generic              (no --hardware, no --model)
     image:  wings_{engine}:{version}-{ts}
-    tar:    Wings_{engine}_{version}_{ts}_{arch}.tar
+    tgz:    Wings_{engine}_{version}_{ts}_{arch}.tgz
 
 Other options:
   -o, --output-tar FILE      Save to explicit tar path (overrides auto-naming)
@@ -176,19 +176,19 @@ generate_output_name() {
   local timestamp="$8"
 
   local engine_name="${engine//-/_}"
+  local name
   if [[ -n "$model" && -n "$hardware" ]]; then
-    # Model-specific: Wings_{engine}_{model}_{hardware}_{timestamp}_{arch}.tar
-    printf '%s/%s_%s_%s_%s_%s_%s.tar' \
-      "$output_dir" "$prefix" "$engine_name" "$model" "$hardware" "$timestamp" "$arch"
+    # Model-specific: Wings_{engine}_{model}_{hardware}_{timestamp}_{arch}.tgz
+    name="${prefix}_${engine_name}_${model}_${hardware}_${timestamp}_${arch}"
   elif [[ -n "$hardware" ]]; then
-    # General release with hardware: Wings_{engine}_{version}_{hardware}_{timestamp}_{arch}.tar
-    printf '%s/%s_%s_%s_%s_%s_%s.tar' \
-      "$output_dir" "$prefix" "$engine_name" "$version" "$hardware" "$timestamp" "$arch"
+    # General release with hardware: Wings_{engine}_{version}_{hardware}_{timestamp}_{arch}.tgz
+    name="${prefix}_${engine_name}_${version}_${hardware}_${timestamp}_${arch}"
   else
-    # Generic: Wings_{engine}_{version}_{timestamp}_{arch}.tar
-    printf '%s/%s_%s_%s_%s_%s.tar' \
-      "$output_dir" "$prefix" "$engine_name" "$version" "$timestamp" "$arch"
+    # Generic: Wings_{engine}_{version}_{timestamp}_{arch}.tgz
+    name="${prefix}_${engine_name}_${version}_${timestamp}_${arch}"
   fi
+  name="${name//-/_}"   # all hyphens -> underscores in the filename
+  printf '%s/%s.tgz' "$output_dir" "$name"
 }
 
 resolve_engine_dir() {
@@ -446,7 +446,8 @@ echo "Building ${target_image} from ${base_image}"
 
 if [[ -n "$save_file" ]]; then
   echo "Saving ${target_image} to ${save_file}"
-  "$container_cli" save -o "$save_file" "$target_image"
+  zipper=pigz; command -v pigz >/dev/null 2>&1 || zipper=gzip
+  "$container_cli" save "$target_image" | "$zipper" > "$save_file"
 
   # ── Metadata ──
   manifest_file="${save_file}.manifest.json"
