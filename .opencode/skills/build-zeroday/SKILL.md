@@ -1,12 +1,12 @@
 ---
 name: build-zeroday
-description: Use when the user asks to build, package, or create Docker images based on vllm/vllm-openai or ascend/vllm-ascend base images. Handles building zeroday images with engine-requirements and optional patches, then exporting as tar files to /os_nfs/06_images/.
+description: Use when the user asks to build, package, or create Docker images based on vllm/vllm-openai or ascend/vllm-ascend base images. Handles building zeroday images with engine-requirements and optional patches, then exporting as tgz files (gzipped via pigz) to /os_nfs/06_images/.
 ---
 
 # Build Zeroday Image
 
 Build Docker images based on vLLM / vLLM Ascend base images, install engine-level
-dependencies, optionally apply patches, and export as tar files.
+dependencies, optionally apply patches, and export as `.tgz` (gzipped via `pigz`).
 
 ## Quick reference
 
@@ -62,14 +62,18 @@ The script runs `build-zeroday-image.sh` from `/home/scd/build-zeroday/`.
 
 ### Output naming convention
 
-With hardware + model: `{prefix}_{engine}_{version}_{hardware}_{model}_{arch}.tar`
+All hyphens in the filename are converted to underscores, and the image is saved as
+`.tgz` (gzip via `pigz`: `docker save <img> | pigz > name.tgz`).
 
-Generic (no hardware/model): `{prefix}_{engine}_{version}_{arch}.tar`
+With hardware + model: `{prefix}_{engine}_{version}_{hardware}_{model}_{arch}.tgz`
+
+Generic (no hardware/model): `{prefix}_{engine}_{version}_{arch}.tgz`
 
 Examples:
-- `Wings_vllm_v0.23.0_RTXPRO5000_glm5.2_x86_64.tar`
-- `Wings_vllm_v0.23.0_x86_64.tar`
-- `Wings_vllm_ascend_v0.19.1rc1_800I_A3_glm5.1_aarch64.tar`
+- `Wings_vllm_v0.23.0_RTXPRO5000_glm5.2_x86_64.tgz`
+- `Wings_vllm_v0.23.0_x86_64.tgz`
+- `Wings_vllm_ascend_v0.19.1rc1_800I_A3_glm5.1_aarch64.tgz`
+- `Wings_vllm_ascend_v0.21.0rc1_a3_20260709145242_aarch64.tgz` (tag `v0.21.0rc1-a3` → underscore)
 
 Use `-o` to override the auto-generated path.
 
@@ -88,8 +92,8 @@ Each build produces:
 
 | File | Content |
 |------|---------|
-| `{name}.tar` | Docker image archive |
-| `{name}.tar.manifest.json` | Metadata: base image, engine, patches, deps, image ID, md5, build time |
+| `{name}.tgz` | Docker image archive, gzipped via `pigz` |
+| `{name}.tgz.manifest.json` | Metadata: base image, engine, patches, deps, image ID, md5, build time |
 | `{output_dir}/md5_checksums.txt` | Cumulative md5 records for all builds in the directory |
 
 ## Engine-requirements
