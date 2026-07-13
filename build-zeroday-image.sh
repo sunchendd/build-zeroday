@@ -15,26 +15,30 @@ Patch mode (optional):
                               Required unless --skip-patch is set.
 
 Naming (auto-generates output filename):
-      --hardware HW           Hardware/CUDA: a3, cu130, h20 (auto-lowercased)
-                               GPU (vllm): auto-detects CUDA version if omitted
+      --hardware HW           机型 or CUDA token (auto-lowercased):
+                               NPU (vllm-ascend): a2 | a3
+                               GPU (vllm): rtx-pro5000 | h20 | cuXXX
+                               GPU without --model auto-detects CUDA if omitted
       --model MODEL           Model name: glm5.2, deepseekv4flash (model-specific image)
       --arch ARCH             Architecture: x86_64 or aarch64 (default: auto-detect)
       --output-dir DIR        Output directory (default: /os_nfs/06_images)
       --prefix PREFIX         Filename prefix (default: Wings)
 
-Output naming convention (filename: hyphens -> underscores, saved as .tgz via pigz):
-  Model-specific       (--model + --hardware)
-    image:  wings_{engine}:{model}-{hardware}-{ts}
-    tgz:    Wings_{engine}_{model}_{hardware}_{ts}_{arch}.tgz
-  GPU release          (--hardware, no --model, engine=vllm)
-    image:  wings_{engine}:{version}-{hardware}-{ts}
-    tgz:    Wings_{engine}_{version}_{hardware}_{ts}_{arch}.tgz
-  Ascend release       (--hardware, no --model, engine=vllm-ascend)
-    image:  wings_{engine}:{version}-{hardware}-{ts}
-    tgz:    Wings_{engine}_{version}_{ts}_{arch}.tgz
-  Generic              (no --hardware, no --model)
-    image:  wings_{engine}:{version}-{ts}
-    tgz:    Wings_{engine}_{version}_{ts}_{arch}.tgz
+Output naming (tag = all lowercase; filename = first letter capitalized, rest lowercase;
+hyphens -> underscores; saved as .tgz via pigz):
+  Model-specific (--model + --hardware):
+    tag:  wings_{engine}:{model}-{hardware}-{ts}
+    tgz:  Wings_{engine}_{model}_{hardware}_{ts}_{arch}.tgz
+  Release        (--hardware, no --model):
+    tag:  wings_{engine}:{version}-{hardware}-{ts}
+    tgz:  Wings_{engine}_{version}_{hardware}_{ts}_{arch}.tgz
+  Generic        (no --hardware, no --model):
+    tag:  wings_{engine}:{version}-{ts}
+    tgz:  Wings_{engine}_{version}_{ts}_{arch}.tgz
+
+  --hardware (机型) allowlist:
+    NPU (vllm-ascend): a2 | a3
+    GPU (vllm):        rtx-pro5000 | h20  (model-specific); cuXXX for CUDA release
 
 Other options:
   -o, --output-tar FILE      Save to explicit tar path (overrides auto-naming)
@@ -138,6 +142,24 @@ validate_arch() {
   fi
 }
 
+validate_hardware() {
+  # 机型 (machine type) allowlist. CUDA release tokens (cu129/cu130/...) are open-ended.
+  local engine="$1" hardware="$2"
+  [[ -z "$hardware" ]] && return 0
+  [[ "$hardware" =~ ^cu[0-9]+$ ]] && return 0
+
+  case "$engine" in
+    vllm-ascend|ascend)
+      [[ "$hardware" == "a2" || "$hardware" == "a3" ]] \
+        || die "Invalid NPU 机型 '${hardware}'. Allowed: a2, a3"
+      ;;
+    vllm)
+      [[ "$hardware" == "rtx-pro5000" || "$hardware" == "h20" ]] \
+        || die "Invalid GPU 机型 '${hardware}'. Allowed: rtx-pro5000, h20 (or cuXXX CUDA token)"
+      ;;
+  esac
+}
+
 default_target_image() {
   local image="$1"
   local engine="$2"
@@ -152,16 +174,19 @@ default_target_image() {
   fi
 
   local engine_tag="${engine//-/_}"   # vllm-ascend -> vllm_ascend
+  local model_l="${model,,}"          # tag rule: all lowercase
+  local version_l="${version,,}"
+  local hardware_l="${hardware,,}"
 
-  if [[ -n "$model" && -n "$hardware" ]]; then
+  if [[ -n "$model_l" && -n "$hardware_l" ]]; then
     # Model-specific: wings_{engine}:{model}-{hardware}-{timestamp}
-    printf 'wings_%s:%s-%s-%s' "$engine_tag" "$model" "$hardware" "$timestamp"
-  elif [[ -n "$hardware" ]]; then
-    # General release with hardware: wings_{engine}:{version}-{hardware}-{timestamp}
-    printf 'wings_%s:%s-%s-%s' "$engine_tag" "$version" "$hardware" "$timestamp"
+    printf 'wings_%s:%s-%s-%s' "$engine_tag" "$model_l" "$hardware_l" "$timestamp"
+  elif [[ -n "$hardware_l" ]]; then
+    # General release: wings_{engine}:{version}-{hardware}-{timestamp}
+    printf 'wings_%s:%s-%s-%s' "$engine_tag" "$version_l" "$hardware_l" "$timestamp"
   else
     # Generic: wings_{engine}:{version}-{timestamp}
-    printf 'wings_%s:%s-%s' "$engine_tag" "$version" "$timestamp"
+    printf 'wings_%s:%s-%s' "$engine_tag" "$version_l" "$timestamp"
   fi
 }
 
@@ -187,7 +212,11 @@ generate_output_name() {
     # Generic: Wings_{engine}_{version}_{timestamp}_{arch}.tgz
     name="${prefix}_${engine_name}_${version}_${timestamp}_${arch}"
   fi
-  name="${name//-/_}"   # all hyphens -> underscores in the filename
+  name="${name//-/_}"   # hyphens -> underscores
+  # Filename rule: first letter capitalized, everything else lowercase
+  local first="${name:0:1}"
+  name="${name,,}"
+  name="${first^^}${name:1}"
   printf '%s/%s.tgz' "$output_dir" "$name"
 }
 
@@ -379,6 +408,9 @@ if [[ "$engine" == "vllm" && -z "$hardware" && -z "$model" ]]; then
   hardware="$(detect_cuda_version "$base_image")"
   echo "Auto-detected CUDA: ${hardware}"
 fi
+
+# Validate 机型 / CUDA token
+validate_hardware "$engine" "$hardware"
 
 # ──────────────────────────────────────────────
 # Extract version & timestamp (used by naming)
