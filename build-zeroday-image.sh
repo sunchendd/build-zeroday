@@ -478,8 +478,11 @@ echo "Building ${target_image} from ${base_image}"
 
 if [[ -n "$save_file" ]]; then
   echo "Saving ${target_image} to ${save_file}"
-  zipper=pigz; command -v pigz >/dev/null 2>&1 || zipper=gzip
-  "$container_cli" save "$target_image" | "$zipper" > "$save_file"
+  if ! command -v pigz >/dev/null 2>&1; then
+    echo "pigz not found, installing..."
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq pigz || { echo "ERROR: failed to install pigz"; exit 1; }
+  fi
+  "$container_cli" save "$target_image" | pigz > "$save_file"
 
   # ── Metadata ──
   manifest_file="${save_file}.manifest.json"

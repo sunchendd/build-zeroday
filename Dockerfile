@@ -15,6 +15,9 @@ COPY vllm-zeroday /root/build-zeroday/vllm-zeroday
 COPY engine-requirements /root/build-zeroday/engine-requirements
 
 RUN set -eux; \
+    apt-get update && apt-get install -y --no-install-recommends cmake ninja-build && rm -rf /var/lib/apt/lists/*; \
+    python3 -m pip install --no-cache-dir nanobind; \
+    mv /usr/bin/python3.10 /usr/bin/python3.10.bak 2>/dev/null || true; \
     engine_req="/root/build-zeroday/engine-requirements/${ENGINE}.txt"; \
     if [ -f "${engine_req}" ]; then \
       if ! command -v python3 >/dev/null 2>&1; then \
@@ -22,8 +25,9 @@ RUN set -eux; \
         exit 1; \
       fi; \
       echo "Installing engine requirements from ${engine_req}"; \
-      python3 -m pip install --no-cache-dir -r "${engine_req}"; \
+      python3 -m pip install --no-cache-dir --no-build-isolation -r "${engine_req}"; \
     fi; \
+    mv /usr/bin/python3.10.bak /usr/bin/python3.10 2>/dev/null || true; \
     if [ "${SKIP_PATCH:-}" = "true" ]; then \
       echo "SKIP_PATCH is set, skipping patch operations."; \
     else \
