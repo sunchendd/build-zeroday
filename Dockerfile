@@ -72,4 +72,5 @@ RUN set -eux; \
       chmod +x "${patch_dir}/${PATCH_SCRIPT}"; \
       cd "${patch_dir}"; \
       bash "./${PATCH_SCRIPT}"; \
-    fi
+    fi; \
+    rm -rf /root/.cache/pip
