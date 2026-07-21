@@ -1,0 +1,7 @@
+# /etc/cron.d/quay-harbor-mirror
+# Save release tags of quay.io/ascend/vllm-ascend and vllm/vllm-openai as .tgz under
+# /os_nfs/06_images/openimages every 10 min. flock -n skips a cycle if a previous run
+# is still busy (large image pulls + pigz can take longer than 10 min).
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+3,13,23,33,43,53 * * * * root flock -n /var/lock/quay-harbor-mirror.lock /usr/local/bin/quay-harbor-mirror.sh >> /var/log/quay-harbor-mirror.log 2>&1
