@@ -5,3 +5,6 @@
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 3,13,23,33,43,53 * * * * root flock -n /var/lock/quay-harbor-mirror.lock /usr/local/bin/quay-harbor-mirror.sh >> /var/log/quay-harbor-mirror.log 2>&1
+# On boot: kick a catch-up `run` immediately (after docker + /os_nfs are ready, so it
+# never races the dependencies). Same flock — overlaps cleanly with the 10-min schedule.
+@reboot root flock -n /var/lock/quay-harbor-mirror.lock bash -c 'for i in $(seq 1 60); do docker info >/dev/null 2>&1 && [ -d /os_nfs/06_images/openimages ] && break; sleep 10; done; /usr/local/bin/quay-harbor-mirror.sh run' >> /var/log/quay-harbor-mirror.log 2>&1

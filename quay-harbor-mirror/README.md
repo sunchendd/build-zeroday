@@ -2,7 +2,8 @@
 
 Every 10 minutes, saves release images from the public registries as `.tgz`
 (gzipped via `pigz`) under `/os_nfs/06_images/openimages`, so the build hosts can
-`docker load` them without internet.
+`docker load` them without internet. It also fires a catch-up `run` on every **boot**
+(after docker + `/os_nfs` are up), so reboots cost no missed cycles.
 
 ```
 /os_nfs/06_images/openimages/
@@ -70,7 +71,7 @@ On **day0-3** (`/usr/local/...`):
 - `etc/quay-harbor-mirror/config.sh` — sources, filters, floors, output dir, webhook. **Edit this to change scope.**
 - `var/lib/quay-harbor-mirror/state.json` — keys = `srcref:tag:arch` already saved.
 - `var/log/quay-harbor-mirror.log` — cron log.
-- `/etc/cron.d/quay-harbor-mirror` — the schedule (every 10 min, flock-guarded).
+- `/etc/cron.d/quay-harbor-mirror` — the schedule: every 10 min **plus an `@reboot` catch-up run** (all flock-guarded, so they never overlap).
 
 In this repo (`quay-harbor-mirror/`): `config.sh`, `quay-harbor-mirror.sh`,
 `quay-harbor-mirror.cron`, `README.md`.
@@ -88,7 +89,7 @@ quay-harbor-mirror.sh save <srcref> <tag>               # ad-hoc single tag (no 
 
 ### Start / stop the automatic schedule
 ```bash
-# enable (every 10 min; skips a cycle if the previous run is still busy)
+# enable (every 10 min + an @reboot catch-up run; a tick is skipped if the previous run is still busy)
 install -m 0644 quay-harbor-mirror.cron /etc/cron.d/quay-harbor-mirror
 # disable
 rm /etc/cron.d/quay-harbor-mirror
@@ -146,3 +147,4 @@ rm /usr/local/bin/quay-harbor-mirror.sh /usr/local/etc/quay-harbor-mirror/config
 - **No Feishu notification:** day0-3 must reach `open.feishu.cn`; check
   `curl -s -o /dev/null -w %{http_code} https://open.feishu.cn/`.
 - **Partial `.tgz.tmp` left behind:** a save was interrupted; it is removed on the next attempt for that arch.
+- **Pulls very slow / log full of `Retrying`:** dockerd is routing quay.io through an HTTP proxy that throttles it to ~20 KB/s. Ensure `quay.io,.quay.io` is in dockerd's `NO_PROXY` (`/etc/systemd/system/docker.service.d/http-proxy.conf`), then `systemctl daemon-reload && systemctl restart docker`. day0-3 reaches quay directly at ~4–21 MB/s; the proxy path is ~200× slower and drops TLS constantly.
