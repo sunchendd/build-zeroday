@@ -1,0 +1,256 @@
+diff --git a/vllm/model_executor/layers/mla.py b/vllm/model_executor/layers/mla.py
+index 1d3e987..90297fe 100644
+--- a/vllm/model_executor/layers/mla.py
++++ b/vllm/model_executor/layers/mla.py
+@@ -86,6 +86,8 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
+         self.indexer = mla_modules.indexer
+         self.indexer_rope_emb = mla_modules.indexer_rotary_emb
+         self.is_sparse = mla_modules.is_sparse
++        self.skip_topk = False
++        self.next_skip_topk = False
+ 
+         if self.indexer is not None:
+             assert hasattr(self.indexer, "topk_tokens")
+@@ -115,7 +117,8 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
+         positions: torch.Tensor,
+         hidden_states: torch.Tensor,
+         llama_4_scaling: torch.Tensor | None = None,
+-    ) -> torch.Tensor:
++        prev_topk_indices: torch.Tensor | None = None,
++    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
+         q_c = None
+         kv_lora = None
+ 
+@@ -160,9 +163,12 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
+             )
+ 
+         if self.indexer and self.is_sparse:
+-            _topk_indices = self.indexer(
+-                hidden_states, q_c, positions, self.indexer_rope_emb
+-            )
++            if not self.skip_topk or prev_topk_indices is None:
++                _topk_indices = self.indexer(
++                    hidden_states, q_c, positions, self.indexer_rope_emb
++                )
++            else:
++                _topk_indices = prev_topk_indices
+ 
+         if llama_4_scaling is not None:
+             q *= llama_4_scaling
+@@ -174,4 +180,9 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
+             output_shape=(hidden_states.shape[0], self.num_heads * self.v_head_dim),
+         )
+ 
+-        return self.o_proj(attn_out)[0]
++        output = self.o_proj(attn_out)[0]
++        if self.indexer and self.is_sparse:
++            if not self.next_skip_topk:
++                return output, None
++            return output, _topk_indices
++        return output
+diff --git a/vllm/model_executor/models/deepseek_eagle.py b/vllm/model_executor/models/deepseek_eagle.py
+index 5c439cd..4ed137d 100644
+--- a/vllm/model_executor/models/deepseek_eagle.py
++++ b/vllm/model_executor/models/deepseek_eagle.py
+@@ -86,7 +86,7 @@ class DeepseekV2Model(nn.Module):
+         hidden_states = self.fc(inputs)
+         residual = None
+         for layer in self.layers:
+-            hidden_states, residual = layer(
++            hidden_states, residual, _ = layer(
+                 positions,
+                 hidden_states,
+                 residual,
+diff --git a/vllm/model_executor/models/deepseek_mtp.py b/vllm/model_executor/models/deepseek_mtp.py
+index c75ee1a..f9b44e0 100644
+--- a/vllm/model_executor/models/deepseek_mtp.py
++++ b/vllm/model_executor/models/deepseek_mtp.py
+@@ -91,6 +91,7 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
+             prefix,
+             config=self.config,
+             topk_indices_buffer=topk_indices_buffer,
++            is_nextn=True,
+         )
+ 
+     def forward(
+@@ -111,7 +112,7 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
+             torch.cat([inputs_embeds, previous_hidden_states], dim=-1)
+         )
+ 
+-        hidden_states, residual = self.mtp_block(
++        hidden_states, residual, _ = self.mtp_block(
+             positions=positions, hidden_states=hidden_states, residual=None
+         )
+         hidden_states = residual + hidden_states
+diff --git a/vllm/model_executor/models/deepseek_v2.py b/vllm/model_executor/models/deepseek_v2.py
+index f1c4a7b..5d9b1a3 100644
+--- a/vllm/model_executor/models/deepseek_v2.py
++++ b/vllm/model_executor/models/deepseek_v2.py
+@@ -842,6 +842,7 @@ class DeepseekV2MLAAttention(nn.Module):
+         quant_config: QuantizationConfig | None = None,
+         prefix: str = "",
+         topk_indices_buffer: torch.Tensor | None = None,
++        is_nextn: bool = False,
+         input_size: int | None = None,
+     ) -> None:
+         super().__init__()
+@@ -961,6 +962,36 @@ class DeepseekV2MLAAttention(nn.Module):
+             self.indexer_rope_emb = None
+             self.indexer = None
+ 
++        if is_nextn or not self.is_v32:
++            skip_topk = False
++            next_skip_topk = False
++        else:
++            index_topk_freq = getattr(config, "index_topk_freq", 1)
++            index_topk_pattern = getattr(config, "index_topk_pattern", None)
++            prefix_parts = prefix.split(".")
++            layer_id = 0
++            for idx, part in enumerate(prefix_parts):
++                if (
++                    part == "layers"
++                    and idx + 1 < len(prefix_parts)
++                    and prefix_parts[idx + 1].isdigit()
++                ):
++                    layer_id = int(prefix_parts[idx + 1])
++                    break
++
++            if index_topk_pattern is None:
++                skip_topk = max(layer_id - 1, 0) % index_topk_freq != 0
++                next_skip_topk = layer_id % index_topk_freq != 0
++            else:
++                skip_topk = (
++                    layer_id < len(index_topk_pattern)
++                    and index_topk_pattern[layer_id] == "S"
++                )
++                next_skip_topk = (
++                    layer_id + 1 < len(index_topk_pattern)
++                    and index_topk_pattern[layer_id + 1] == "S"
++                )
++
+         mla_modules = MLAModules(
+             kv_a_layernorm=self.kv_a_layernorm,
+             kv_b_proj=self.kv_b_proj,
+@@ -995,14 +1026,22 @@ class DeepseekV2MLAAttention(nn.Module):
+             quant_config,
+             prefix,
+         )
++        self.mla_attn.skip_topk = skip_topk
++        self.mla_attn.next_skip_topk = next_skip_topk
+ 
+     def forward(
+         self,
+         positions: torch.Tensor,
+         hidden_states: torch.Tensor,
+         llama_4_scaling: torch.Tensor | None,
+-    ) -> torch.Tensor:
+-        return self.mla_attn(positions, hidden_states, llama_4_scaling)
++        prev_topk_indices: torch.Tensor | None = None,
++    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
++        return self.mla_attn(
++            positions,
++            hidden_states,
++            llama_4_scaling,
++            prev_topk_indices=prev_topk_indices,
++        )
+ 
+ 
+ class DeepseekV2DecoderLayer(nn.Module):
+@@ -1012,6 +1051,7 @@ class DeepseekV2DecoderLayer(nn.Module):
+         prefix: str,
+         config: DeepseekV2Config | None = None,
+         topk_indices_buffer: torch.Tensor | None = None,
++        is_nextn: bool = False,
+     ) -> None:
+         super().__init__()
+ 
+@@ -1047,7 +1087,7 @@ class DeepseekV2DecoderLayer(nn.Module):
+             attn_cls = DeepseekV2MLAAttention
+         else:
+             attn_cls = DeepseekV2Attention
+-        self.self_attn = attn_cls(
++        attn_kwargs = dict(
+             vllm_config=vllm_config,
+             config=config,
+             hidden_size=self.hidden_size,
+@@ -1062,7 +1102,11 @@ class DeepseekV2DecoderLayer(nn.Module):
+             quant_config=quant_config,
+             prefix=f"{prefix}.self_attn",
+             topk_indices_buffer=topk_indices_buffer,
++            is_nextn=is_nextn,
+         )
++        if attn_cls is not DeepseekV2MLAAttention:
++            attn_kwargs.pop("is_nextn")
++        self.self_attn = attn_cls(**attn_kwargs)
+ 
+         if (
+             config.n_routed_experts is not None
+@@ -1095,7 +1139,8 @@ class DeepseekV2DecoderLayer(nn.Module):
+         hidden_states: torch.Tensor,
+         residual: torch.Tensor | None,
+         llama_4_scaling: torch.Tensor | None = None,
+-    ) -> torch.Tensor:
++        prev_topk_indices: torch.Tensor | None = None,
++    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+         # Self Attention
+         if residual is None:
+             residual = hidden_states.clone()
+@@ -1109,7 +1154,13 @@ class DeepseekV2DecoderLayer(nn.Module):
+         }
+         if not self.use_mha:
+             attn_kwargs["llama_4_scaling"] = llama_4_scaling
++        if isinstance(self.self_attn, DeepseekV2MLAAttention):
++            attn_kwargs["prev_topk_indices"] = prev_topk_indices
+         hidden_states = self.self_attn(**attn_kwargs)
++        if isinstance(hidden_states, tuple):
++            hidden_states, topk_indices = hidden_states
++        else:
++            topk_indices = None
+ 
+         if (
+             not isinstance(self.self_attn, DeepseekAttention)
+@@ -1136,7 +1187,7 @@ class DeepseekV2DecoderLayer(nn.Module):
+             # of DeepseekV2MOE
+             hidden_states *= 1.0 / self.routed_scaling_factor
+ 
+-        return hidden_states, residual
++        return hidden_states, residual, topk_indices
+ 
+ 
+ @support_torch_compile
+@@ -1231,6 +1282,7 @@ class DeepseekV2Model(nn.Module):
+         else:
+             llama_4_scaling = None
+ 
++        topk_indices = None
+         aux_hidden_states = []
+         for idx, layer in enumerate(
+             islice(self.layers, self.start_layer, self.end_layer),
+@@ -1238,8 +1290,12 @@ class DeepseekV2Model(nn.Module):
+         ):
+             if idx in self.aux_hidden_state_layers:
+                 aux_hidden_states.append(hidden_states + residual)
+-            hidden_states, residual = layer(
+-                positions, hidden_states, residual, llama_4_scaling
++            hidden_states, residual, topk_indices = layer(
++                positions,
++                hidden_states,
++                residual,
++                llama_4_scaling,
++                prev_topk_indices=topk_indices,
+             )
+ 
+         if not get_pp_group().is_last_rank:
+diff --git a/vllm/model_executor/models/longcat_flash_mtp.py b/vllm/model_executor/models/longcat_flash_mtp.py
+index 13921d7..f3af359 100644
+--- a/vllm/model_executor/models/longcat_flash_mtp.py
++++ b/vllm/model_executor/models/longcat_flash_mtp.py
+@@ -64,7 +64,7 @@ class LongCatMultiTokenPredictorLayer(nn.Module):
+             torch.cat([inputs_embeds, previous_hidden_states], dim=-1)
+         )
+ 
+-        hidden_states, residual = self.mtp_block(
++        hidden_states, residual, _ = self.mtp_block(
+             positions=positions, hidden_states=hidden_states, residual=None
+         )
+         hidden_states, _ = self.final_layernorm(hidden_states, residual)

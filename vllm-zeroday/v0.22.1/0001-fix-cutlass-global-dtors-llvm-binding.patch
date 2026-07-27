@@ -1,0 +1,34 @@
+From 14cf678f38721a0922d0779791d01a0d928b3b77 Mon Sep 17 00:00:00 2001
+From: Your Name <you@example.com>
+Date: Wed, 10 Jun 2026 02:34:43 +0000
+Subject: [PATCH] fix
+
+---
+ python_packages/cutlass/cutlass_dsl/tvm_ffi_provider.py | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/python_packages/cutlass/cutlass_dsl/tvm_ffi_provider.py b/python_packages/cutlass/cutlass_dsl/tvm_ffi_provider.py
+index dd4741e..5d36c6e 100644
+--- a/python_packages/cutlass/cutlass_dsl/tvm_ffi_provider.py
++++ b/python_packages/cutlass/cutlass_dsl/tvm_ffi_provider.py
+@@ -220,6 +220,7 @@ class TVMFFICuteCallProvider(DynamicParamPackCallProvider):
+                 global_dtors = llvm.mlir_global_dtors(
+                     dtors=[],
+                     priorities=[],
++                    data=[],
+                 )
+         else:
+             # use the existing global destructors
+@@ -232,6 +233,9 @@ class TVMFFICuteCallProvider(DynamicParamPackCallProvider):
+         global_dtors.attributes["priorities"] += [
+             ir.IntegerAttr.get(self.i32_type, 65535)
+         ]  # the default priority
++        global_dtors.attributes["data"] += [
++            ir.FlatSymbolRefAttr.get(unload_func_wrapper_symbol)
++        ]  # data is unused here, but the op requires a matching entry
+         return current_block
+ 
+     def check_cuda_error(
+-- 
+2.34.1
+

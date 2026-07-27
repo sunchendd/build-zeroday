@@ -1,0 +1,216 @@
+diff --git a/vllm_ascend/attention/sfa_v1.py b/vllm_ascend/attention/sfa_v1.py
+index 7b1da4fb..fa8ad7c8 100644
+--- a/vllm_ascend/attention/sfa_v1.py
++++ b/vllm_ascend/attention/sfa_v1.py
+@@ -1072,7 +1072,9 @@ class AscendSFAImpl(MLAAttentionImpl):
+         attn_metadata: M,
+         need_gather_q_kv: bool = False,
+         output: torch.Tensor | None = None,
+-    ) -> torch.Tensor:
++        prev_topk_indices: torch.Tensor | None = None,
++        skip_topk: bool = False,
++    ) -> torch.Tensor | None:
+         assert output is not None, "Output tensor must be provided."
+         if attn_metadata is None:
+             # Profiling run.
+@@ -1080,7 +1082,8 @@ class AscendSFAImpl(MLAAttentionImpl):
+                 for layer in self.layer_sharding_kwargs or []:
+                     if is_hidden_layer(layer):
+                         reach_layer_for_shard_weight_series(layer)
+-            return output.fill_(0)
++            output.fill_(0)
++            return None
+ 
+         cos = attn_metadata.cos
+         sin = attn_metadata.sin
+@@ -1242,16 +1245,19 @@ class AscendSFAImpl(MLAAttentionImpl):
+             if self.is_kv_producer:
+                 attn_metadata.reshape_cache_event.record()
+ 
+-        topk_indices = self.indexer_select_post_process(
+-            x=hidden_states,
+-            q_c=q_c,
+-            kv_cache=kv_cache,
+-            attn_metadata=attn_metadata,
+-            cos=cos,
+-            sin=sin,
+-            actual_seq_lengths_query=actual_seq_lengths_query,
+-            actual_seq_lengths_key=actual_seq_lengths_key,
+-        )
++        if skip_topk and prev_topk_indices is not None:
++            topk_indices = prev_topk_indices
++        else:
++            topk_indices = self.indexer_select_post_process(
++                x=hidden_states,
++                q_c=q_c,
++                kv_cache=kv_cache,
++                attn_metadata=attn_metadata,
++                cos=cos,
++                sin=sin,
++                actual_seq_lengths_query=actual_seq_lengths_query,
++                actual_seq_lengths_key=actual_seq_lengths_key,
++            )
+ 
+         attn_output = self._execute_sparse_flash_attention_process(
+             ql_nope, q_pe, kv_cache, topk_indices, attn_metadata, actual_seq_lengths_query, actual_seq_lengths_key
+@@ -1277,11 +1283,11 @@ class AscendSFAImpl(MLAAttentionImpl):
+                 should_shard_weight=full_gather_o_proj_enabled,
+             )
+             if not require_o_proj_forward:
+-                return result
++                return topk_indices
+             attn_output = result
+ 
+         output[...] = self.o_proj(attn_output)[0]
+ 
+         maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
+ 
+-        return output_padded
++        return topk_indices
+diff --git a/vllm_ascend/ops/mla.py b/vllm_ascend/ops/mla.py
+index 85a08dc1..b2cde627 100644
+--- a/vllm_ascend/ops/mla.py
++++ b/vllm_ascend/ops/mla.py
+@@ -36,6 +36,9 @@ from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+ from vllm_ascend.utils import is_vl_model, parse_layer_idx, vllm_version_is
+ 
+ 
++_MLA_FAKE_IMPL_META: dict[str, int] = {}
++
++
+ class IndexerWrapper(nn.Module):
+     """
+     A wrapper of Indexer for Deepseek v3.2.
+@@ -94,6 +97,8 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
+         self.qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
+         self.v_head_dim = v_head_dim
+         self.prefix = prefix
++        self.skip_topk = False
++        self.next_skip_topk = False
+         hf_config = get_current_vllm_config().model_config.hf_text_config
+         self.enable_shared_expert_dp = get_ascend_config().enable_shared_expert_dp
+         self.tp_size = get_tensor_model_parallel_world_size()
+@@ -102,6 +107,10 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
+             ascend_indexer = IndexerWrapper(mla_modules.indexer)
+         else:
+             ascend_indexer = None
++        self.indexer = ascend_indexer
++        self.is_sparse = mla_modules.is_sparse
++        if self.indexer is not None and self.is_sparse:
++            _MLA_FAKE_IMPL_META[prefix] = self.indexer.topk_tokens
+         self.mla_attn = MLAAttention(
+             num_heads=num_heads,
+             scale=scale,
+@@ -157,9 +166,11 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
+         self,
+         positions: torch.Tensor,
+         hidden_states: torch.Tensor,
++        llama_4_scaling: torch.Tensor | None = None,
++        prev_topk_indices: torch.Tensor | None = None,
+         kv_cache: torch.Tensor | None = None,
+         attn_metadata: AttentionMetadata | None = None,
+-    ) -> torch.Tensor:
++    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
+         hidden_dim = hidden_states.shape[-1]
+ 
+         if _EXTRA_CTX.flash_comm_v1_enabled and self.tp_size > 1 and self.is_vl_first_layer:
+@@ -170,8 +181,23 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
+             need_gather_q_kv = _EXTRA_CTX.flash_comm_v1_enabled
+             output = torch.empty(hidden_states.shape, dtype=hidden_states.dtype, device=hidden_states.device)
+ 
+-        torch.ops.vllm.mla_forward(hidden_states, need_gather_q_kv, output, self.prefix)
++        prev_topk_indices_arg = prev_topk_indices
++        if prev_topk_indices_arg is None:
++            prev_topk_indices_arg = torch.empty(0, dtype=torch.int32, device=hidden_states.device)
++        topk_indices = torch.ops.vllm.mla_forward(
++            hidden_states,
++            need_gather_q_kv,
++            output,
++            self.prefix,
++            prev_topk_indices_arg,
++        )
+         output = output.view(-1, hidden_dim)
++        if self.indexer is not None and self.is_sparse:
++            if not self.next_skip_topk:
++                return output, None
++            if topk_indices.numel() == 0:
++                return output, None
++            return output, topk_indices
+         return output
+ 
+ 
+@@ -180,7 +206,8 @@ def mla_forward(
+     need_gather_q_kv: bool,
+     output: torch.Tensor,
+     layer_name: str,
+-) -> None:
++    prev_topk_indices: torch.Tensor | None,
++) -> torch.Tensor:
+     forward_context: ForwardContext = get_forward_context()
+     self = forward_context.no_compile_layers[layer_name]
+     if forward_context.attn_metadata:
+@@ -188,10 +215,31 @@ def mla_forward(
+     else:
+         attn_metadata = forward_context.attn_metadata
+     kv_cache = self.mla_attn.kv_cache
++    prev_topk_indices_arg = (
++        prev_topk_indices
++        if prev_topk_indices is not None and prev_topk_indices.numel() > 0
++        else None
++    )
++    if self.indexer is not None and self.is_sparse:
++        # Return topk indices explicitly so torch.compile/ACLGraph can preserve
++        # the cross-layer indexcache dependency as part of the graph inputs.
++        topk_indices = self.mla_attn.impl.forward(
++            self.mla_attn.layer_name,
++            hidden_states,
++            kv_cache,
++            attn_metadata,
++            need_gather_q_kv,
++            output,
++            prev_topk_indices=prev_topk_indices_arg,
++            skip_topk=self.skip_topk,
++        )
++        if topk_indices is None:
++            return torch.empty((0, 0), dtype=torch.int32, device=hidden_states.device)
++        return topk_indices
+     self.mla_attn.impl.forward(
+         self.mla_attn.layer_name, hidden_states, kv_cache, attn_metadata, need_gather_q_kv, output
+     )
+-    return
++    return torch.empty((0, 0), dtype=torch.int32, device=hidden_states.device)
+ 
+ 
+ def mla_forward_fake(
+@@ -199,8 +247,16 @@ def mla_forward_fake(
+     need_gather_q_kv: bool,
+     output: torch.Tensor,
+     layer_name: str,
+-) -> None:
+-    return
++    prev_topk_indices: torch.Tensor | None,
++) -> torch.Tensor:
++    topk_tokens = _MLA_FAKE_IMPL_META.get(layer_name)
++    if topk_tokens is None:
++        return torch.empty((0, 0), dtype=torch.int32, device=hidden_states.device)
++    return torch.empty(
++        (hidden_states.shape[0], topk_tokens),
++        dtype=torch.int32,
++        device=hidden_states.device,
++    )
+ 
+ 
+ direct_register_custom_op(
+diff --git a/vllm_ascend/patch/worker/patch_deepseek_mtp.py b/vllm_ascend/patch/worker/patch_deepseek_mtp.py
+index bc147d74..b60000ef 100644
+--- a/vllm_ascend/patch/worker/patch_deepseek_mtp.py
++++ b/vllm_ascend/patch/worker/patch_deepseek_mtp.py
+@@ -44,7 +44,7 @@ class AscendDeepSeekMultiTokenPredictorLayer(DeepSeekMultiTokenPredictorLayer):
+ 
+         hidden_states = self.eh_proj(torch.cat([inputs_embeds, previous_hidden_states], dim=-1))
+ 
+-        hidden_states, residual = self.mtp_block(positions=positions, hidden_states=hidden_states, residual=None)
++        hidden_states, residual, _ = self.mtp_block(positions=positions, hidden_states=hidden_states, residual=None)
+         hidden_states = residual + hidden_states
+         return hidden_states
+ 

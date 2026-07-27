@@ -1,0 +1,218 @@
+diff --git a/vllm_ascend/worker/model_runner_v1.py b/vllm_ascend/worker/model_runner_v1.py
+index 57d1bb49..04a70927 100644
+--- a/vllm_ascend/worker/model_runner_v1.py
++++ b/vllm_ascend/worker/model_runner_v1.py
+@@ -152,6 +152,7 @@ from vllm_ascend.utils import (
+ )
+ from vllm_ascend.worker.npu_input_batch import NPUInputBatch
+ from vllm_ascend.worker.pcp_utils import PCPManager
++from vllm_ascend.worker.utils import AscendKVBlockZeroer
+ 
+ from vllm_ascend.ascend_forward_context import (  # isort: skip
+     MoECommType,
+@@ -3488,6 +3489,18 @@ class NPUModelRunner(GPUModelRunner):
+         if self.model_config.enable_return_routed_experts:
+             self.init_routed_experts_capturer()
+ 
++    def _init_kv_zero_meta(self) -> None:
++        self._kv_block_zeroer = AscendKVBlockZeroer(
++            self.device, self.pin_memory
++        )
++        self._kv_block_zeroer.init_meta(
++            attn_groups_iter=self._kv_cache_spec_attn_group_iterator(),
++            kernel_block_sizes=self.kernel_block_sizes,
++            cache_dtype=self.cache_config.cache_dtype,
++            runner_only_attn_layers=self.runner_only_attn_layers,
++            static_forward_context=self.compilation_config.static_forward_context,
++        )
++
+     def _bind_routed_experts_capturer(self, capturer) -> None:
+         # Upstream binds via ``module.router.set_capture_fn(...)`` on
+         # FusedMoE layers whose router is a ``BaseRouter``. Ascend's
+diff --git a/vllm_ascend/worker/utils.py b/vllm_ascend/worker/utils.py
+new file mode 100644
+index 00000000..318ef047
+--- /dev/null
++++ b/vllm_ascend/worker/utils.py
+@@ -0,0 +1,160 @@
++from collections.abc import Iterable
++from itertools import product as iprod
++from typing import Any
++
++import torch
++from vllm.triton_utils import tl, triton
++from vllm.utils.math_utils import largest_power_of_2_divisor
++from vllm.v1.kv_cache_interface import FullAttentionSpec
++from vllm.v1.worker.utils import AttentionGroup, KVBlockZeroer
++
++from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
++
++
++@triton.jit
++def _zero_kv_blocks_kernel(
++    seg_addrs_ptr,
++    block_ids_ptr,
++    n_blocks,
++    N_SEGS: tl.constexpr,
++    PAGE_SIZE_EL: tl.constexpr,
++    BLOCK_SIZE: tl.constexpr,
++    GRID_SIZE: tl.constexpr,
++):
++    pid = tl.program_id(0)
++    chunks = PAGE_SIZE_EL // BLOCK_SIZE
++    work_per_block = N_SEGS * chunks
++    total_work = n_blocks * work_per_block
++    for work_idx in range(pid, total_work, GRID_SIZE):
++        block_index = work_idx // work_per_block
++        remainder = work_idx % work_per_block
++        seg_index = remainder // chunks
++        chunk_index = remainder % chunks
++        block_id = tl.load(block_ids_ptr + block_index)
++        seg_addr = tl.load(seg_addrs_ptr + seg_index)
++        ptr = tl.cast(seg_addr, tl.pointer_type(tl.int32))
++        offset = (
++            block_id.to(tl.int64) * PAGE_SIZE_EL
++            + chunk_index.to(tl.int64) * BLOCK_SIZE
++        )
++        cols = tl.arange(0, BLOCK_SIZE).to(tl.int64)
++        tl.store(ptr + offset + cols, tl.zeros([BLOCK_SIZE], dtype=tl.int32))
++
++
++class AscendKVBlockZeroer(KVBlockZeroer):
++    """Zero full-attention pages that previously held Mamba state."""
++
++    def init_meta(
++        self,
++        attn_groups_iter: Iterable[AttentionGroup],
++        kernel_block_sizes: list[int],
++        cache_dtype: str,
++        runner_only_attn_layers: set[str],
++        static_forward_context: dict[str, Any],
++    ) -> None:
++        seen_ptrs: set[int] = set()
++        seg_addrs: list[int] = []
++        page_size_el: int | None = None
++
++        for group in attn_groups_iter:
++            spec = group.kv_cache_spec
++            if not isinstance(spec, FullAttentionSpec):
++                continue
++            if group.kv_cache_group_id >= len(kernel_block_sizes):
++                continue
++            kernel_bs = kernel_block_sizes[group.kv_cache_group_id][0]
++            ratio = spec.block_size // kernel_bs
++
++            for layer_name in group.layer_names:
++                if layer_name in runner_only_attn_layers:
++                    continue
++                kv_tuple = static_forward_context[layer_name].kv_cache
++                assert len(kv_tuple) == 2, "K and V are not stored separately"
++                for kv in kv_tuple:
++                    data_ptr = kv.data_ptr()
++                    if data_ptr in seen_ptrs:
++                        continue
++                    seen_ptrs.add(data_ptr)
++
++                    element_size = kv.element_size()
++                    block_bytes = kv.stride(0) * element_size
++                    assert block_bytes % 4 == 0
++                    current_page_size = block_bytes // 4 * ratio
++                    if page_size_el is None:
++                        page_size_el = current_page_size
++                    else:
++                        assert page_size_el == current_page_size, (
++                            f"Non-uniform page sizes: {page_size_el} vs "
++                            f"{current_page_size}"
++                        )
++
++                    outer_dims = [
++                        dim
++                        for dim in range(0)
++                        if kv.stride(dim) * element_size > block_bytes
++                    ]
++                    outer_strides = [
++                        kv.stride(dim) * element_size for dim in outer_dims
++                    ]
++                    for outer in iprod(
++                        *(range(kv.shape[dim]) for dim in outer_dims)
++                    ):
++                        offset_bytes = sum(
++                            index * stride
++                            for index, stride in zip(outer, outer_strides)
++                        )
++                        seg_addrs.append(data_ptr + offset_bytes)
++
++        if not seg_addrs or page_size_el is None:
++            self._meta = None
++            return
++
++        block_size = min(largest_power_of_2_divisor(page_size_el), 8192)
++        self._id_cap = 8192
++        self._ids_pinned = torch.empty(
++            self._id_cap,
++            dtype=torch.int64,
++            pin_memory=self.pin_memory,
++        )
++        self._ids_gpu = torch.empty(
++            self._id_cap, dtype=torch.int64, device=self.device
++        )
++        self._meta = (
++            torch.tensor(seg_addrs, dtype=torch.uint64, device=self.device),
++            page_size_el,
++            block_size,
++            len(seg_addrs),
++        )
++
++    def zero_block_ids(self, block_ids: list[int]) -> None:
++        if not block_ids or self._meta is None:
++            return
++        seg_addrs, page_size_el, block_size, num_segments = self._meta
++        num_blocks = len(block_ids)
++        if num_blocks > self._id_cap:
++            self._id_cap = num_blocks * 2
++            self._ids_pinned = torch.empty(
++                self._id_cap,
++                dtype=torch.int64,
++                pin_memory=self.pin_memory,
++            )
++            self._ids_gpu = torch.empty(
++                self._id_cap, dtype=torch.int64, device=self.device
++            )
++        self._ids_pinned[:num_blocks].numpy()[:] = block_ids
++        block_ids_gpu = self._ids_gpu[:num_blocks]
++        block_ids_gpu.copy_(self._ids_pinned[:num_blocks], non_blocking=True)
++        chunks = page_size_el // block_size
++        total_work = num_blocks * num_segments * chunks
++        grid = min(total_work, get_vectorcore_num()) if total_work > 0 else 0
++        if grid == 0:
++            return
++        _zero_kv_blocks_kernel[(grid,)](
++            seg_addrs,
++            block_ids_gpu,
++            num_blocks,
++            N_SEGS=num_segments,
++            PAGE_SIZE_EL=page_size_el,
++            BLOCK_SIZE=block_size,
++            GRID_SIZE=grid,
++        )
+diff --git a/vllm_ascend/worker/worker.py b/vllm_ascend/worker/worker.py
+index 5e410ece..08fa9f7c 100644
+--- a/vllm_ascend/worker/worker.py
++++ b/vllm_ascend/worker/worker.py
+@@ -684,6 +684,16 @@ class NPUWorker(WorkerBase):
+         with context:
+             self.model_runner.initialize_kv_cache(kv_cache_config)
+ 
++            if (
++                kv_cache_config.needs_kv_cache_zeroing
++                and hasattr(self.model_runner, "_init_kv_zero_meta")
++                and self.vllm_config is not None
++                and self.vllm_config.speculative_config is not None
++                and self.vllm_config.speculative_config.num_speculative_tokens
++                > 1
++            ):
++                self.model_runner._init_kv_zero_meta()
++
+     def profile(self, is_start: bool = True, profile_prefix: str | None = None):
+         # Check if profiling is enabled (RFC #6954 - align with upstream vLLM)
+         if self.profiler_config is None or self.profiler_config.profiler is None:

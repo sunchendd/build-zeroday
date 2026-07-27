@@ -1,0 +1,247 @@
+From 86d888080e425bfe06fef307b9eac344de7e68b3 Mon Sep 17 00:00:00 2001
+From: shenbowen <shenbowen@xfusion.com>
+Date: Thu, 28 May 2026 16:20:23 +0800
+Subject: [PATCH] Fix performance fluctuation issues on 910c + kvcache2cpu
+
+Signed-off-by: shenbowen <shenbowen@xfusion.com>
+---
+ .../cpu_offload/cpu_offload_connector.py      | 154 ++++++++++++------
+ 1 file changed, 107 insertions(+), 47 deletions(-)
+
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/cpu_offload/cpu_offload_connector.py b/vllm_ascend/distributed/kv_transfer/kv_pool/cpu_offload/cpu_offload_connector.py
+index d87a2eee..c2eb4384 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/cpu_offload/cpu_offload_connector.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/cpu_offload/cpu_offload_connector.py
+@@ -43,6 +43,29 @@ from vllm.model_executor.layers.attention import Attention, MLAAttention
+ from vllm_ascend.models.layer.attention.layer import DSAAttention
+ 
+ 
++
++@dataclass
++class _RequestProxy:
++    """Lightweight proxy carrying only the fields the metadata server needs.
++
++    Replaces copy.deepcopy(Request) which for 131k-token requests involves
++    ~500KB of data and ~100ms of deepcopy+pickle overhead per call.
++    """
++    request_id: str
++    block_hashes: list
++    num_tokens: int
++    sampling_params: Any
++
++    @classmethod
++    def from_request(cls, request: "Request") -> "_RequestProxy":
++        return cls(
++            request_id=request.request_id,
++            block_hashes=request.block_hashes,
++            num_tokens=request.num_tokens,
++            sampling_params=request.sampling_params,
++        )
++
++
+ @dataclass
+ class ReqMeta:
+     gpu_block_ids: tuple[list[int], ...]
+@@ -128,6 +151,9 @@ class CPUOffloadingConnector(KVConnectorBase_V1, SupportsHMA):
+     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str] | None, set[str] | None]:
+         if self.connector_worker is None:
+             return None, None
++        # Return done_sending so the scheduler calls _free_blocks() via
++        # _update_from_kv_xfer_finished after the async GPU->CPU save
++        # completes. This releases the delayed blocks to the LRU free queue.
+         return self.connector_worker.get_finished(), None
+ 
+     # Scheduler-side methods
+@@ -150,9 +176,15 @@ class CPUOffloadingConnector(KVConnectorBase_V1, SupportsHMA):
+     def request_finished(self, request: "Request", block_ids: list[int]) -> tuple[bool, dict[str, Any] | None]:
+         if self.connector_scheduler is not None:
+             self.connector_scheduler.request_finished(request)
+-            # delay_free_blocks=True: keep GPU blocks until async CPU save completes
++            # delay_free_blocks=True: keep GPU blocks allocated until async
++            # CPU save completes. This is safe for prefix cache because
++            # cache_full_blocks() (called during each scheduler step) has
++            # already registered the block hashes in cached_block_hash_to_block,
++            # so new requests CAN still hit them via prefix cache lookup even
++            # though the blocks are not yet in the free_block_queue.
++            # After save completes, get_finished() returns done_sending, and
++            # the scheduler calls _free_blocks() to release them to the LRU.
+             return True, None
+-        # No CPU offload scheduler → free GPU blocks immediately to prevent deadlock
+         return False, None
+ 
+     def request_finished_all_groups(
+@@ -187,8 +219,7 @@ class CPUOffloadingConnectorScheduler:
+         logger.info(f"swap_in_threshold: {self.swap_in_threshold}")
+ 
+     def get_num_new_matched_tokens(self, ori_request: "Request", num_computed_tokens: int) -> tuple[int, bool]:
+-        request = copy.deepcopy(ori_request)
+-        request._block_hasher = None
++        request = _RequestProxy.from_request(ori_request)
+         num_cpu_computed_tokens, load_async = self.zmq_rpc_client.call("get_matched_num_and_touch", request)
+         self.num_gpu_computed_tokens[request.request_id] = num_computed_tokens
+         # Align to load_align_block_size for multi-group consistency
+@@ -223,7 +254,14 @@ class CPUOffloadingConnectorScheduler:
+         unallocated_req_ids = set(
+             self.num_gpu_computed_tokens.keys() - self.allocated_req_ids - scheduler_output.num_scheduled_tokens.keys()
+         )
+-        new_cpu_block_ids = self.zmq_rpc_client.call("allocate_slots", num_tokens, unallocated_req_ids)
++        # Fix: skip ZMQ RPC when there are no new requests and no unallocated
++        # requests. During pure decode steps the allocate_slots call is
++        # unnecessary overhead (~1-2ms per step ≈ 3-5% TPOT degradation).
++        has_new_reqs = bool(scheduler_output.scheduled_new_reqs) or bool(self.num_gpu_computed_tokens)
++        if has_new_reqs or unallocated_req_ids:
++            new_cpu_block_ids = self.zmq_rpc_client.call("allocate_slots", num_tokens, unallocated_req_ids)
++        else:
++            new_cpu_block_ids = {}
+         if new_cpu_block_ids:
+             actual_num_groups = max(len(block_ids) for block_ids in new_cpu_block_ids.values())
+             if actual_num_groups > self.num_kv_cache_groups:
+@@ -265,8 +303,7 @@ class CPUOffloadingConnectorScheduler:
+         return metadata
+ 
+     def request_finished(self, ori_request: "Request"):
+-        request = copy.deepcopy(ori_request)
+-        request._block_hasher = None
++        request = _RequestProxy.from_request(ori_request)
+         self.finished_req_ids.append(request.request_id)
+         # inform metadata server to record request, and free it after finish sending
+         self.zmq_rpc_client.call("record_request_cache_and_free_slots", request)
+@@ -293,10 +330,11 @@ class CPUOffloadingConnectorWorker:
+         self.layer_to_group_id: dict[str, int] = {}
+         self.save_input_queue: queue.Queue[tuple[str, ReqMeta]] = queue.Queue()
+         self.save_output_queue: queue.Queue[str] = queue.Queue()
+-        self.save_thread = threading.Thread(target=self._save_listener)
++        self.save_thread = threading.Thread(target=self._save_listener, daemon=True)
+         self.save_thread.start()
+         self.done_sending_count: defaultdict[str, int] = defaultdict(int)
+ 
++
+         # start metadata server to init cpu_kv_cache_manager and handle rpc requests
+         # all dp shared the same metadata server, only start the process on data_rank 0
+         if vllm_config.parallel_config.data_parallel_rank == 0 and self.tp_rank == 0 and self.pp_rank == 0:
+@@ -401,6 +439,13 @@ class CPUOffloadingConnectorWorker:
+ 
+     def start_load_kv(self) -> None:
+         self.current_layer = 0
++        # Note: load and save operate on DIFFERENT blocks (load=prefix-hit
++        # blocks, save=newly-computed blocks), so no data race.
++        # They run in parallel on separate streams.
++        num_blocks = len(self.load_block_mapping[0]) if self.load_block_mapping else 0
++        if num_blocks > 0:
++            logger.info("start_load_kv: loading %d blocks across %d layers",
++                        num_blocks, len(self.layer_names))
+         self.load_kv_layer(0)
+ 
+     def wait_for_layer_load(self) -> None:
+@@ -422,6 +467,8 @@ class CPUOffloadingConnectorWorker:
+         if group_id >= len(self.load_block_mapping):
+             return
+         block_mapping = self.load_block_mapping[group_id]
++        if not block_mapping:
++            return
+         with torch.npu.stream(self.load_stream):
+             for cpu_block_id, gpu_block_id in block_mapping:
+                 for gpu_layer_part, cpu_layer_part in zip(gpu_kv_caches, cpu_kv_caches):
+@@ -470,47 +517,60 @@ class CPUOffloadingConnectorWorker:
+ 
+     def _save_listener(self):
+         while True:
+-            req_id, req = self.save_input_queue.get()
+-            save_block_mapping: dict[int, list[tuple[int, int]]] = {
+-                group_id: [] for group_id in range(len(self.group_block_sizes))
+-            }
+-            for group_id, block_size in enumerate(self.group_block_sizes):
+-                if group_id >= len(req.cpu_block_ids) or group_id >= len(req.gpu_block_ids):
+-                    continue
+-                save_start = req.num_cpu_computed_tokens // block_size
+-                save_end = min(
+-                    (req.num_computed_tokens + req.num_scheduled_tokens) // block_size,
+-                    len(req.cpu_block_ids[group_id]),
+-                    len(req.gpu_block_ids[group_id]),
+-                )
+-                if save_end < (req.num_computed_tokens + req.num_scheduled_tokens) // block_size:
+-                    logger.debug(
+-                        "save_listener block mismatch for %s group=%d: cpu=%d gpu=%d target=%d",
+-                        req_id, group_id,
+-                        len(req.cpu_block_ids[group_id]), len(req.gpu_block_ids[group_id]),
++            req_id = None
++            try:
++                req_id, req = self.save_input_queue.get()
++                save_block_mapping: dict[int, list[tuple[int, int]]] = {
++                    group_id: [] for group_id in range(len(self.group_block_sizes))
++                }
++                for group_id, block_size in enumerate(self.group_block_sizes):
++                    if group_id >= len(req.cpu_block_ids) or group_id >= len(req.gpu_block_ids):
++                        continue
++                    save_start = req.num_cpu_computed_tokens // block_size
++                    save_end = min(
+                         (req.num_computed_tokens + req.num_scheduled_tokens) // block_size,
++                        len(req.cpu_block_ids[group_id]),
++                        len(req.gpu_block_ids[group_id]),
+                     )
+-                for i in range(save_start, save_end):
+-                    save_block_mapping[group_id].append(
+-                        (req.gpu_block_ids[group_id][i], req.cpu_block_ids[group_id][i]))
+-            with torch.npu.stream(self.save_stream):
+-                if self.use_mla:
+-                    start, step = self.tp_rank, self.tp_world_size
+-                else:
+-                    start, step = 0, 1
+-                for layer_name, gpu_kv_caches in self.gpu_kv_caches.items():
+-                    if layer_name not in self.cpu_kv_caches:
+-                        continue
+-                    group_id = self.layer_to_group_id.get(layer_name, 0)
+-                    cpu_kv_caches = self.cpu_kv_caches[layer_name]
+-                    block_mapping = save_block_mapping.get(group_id, [])
+-                    for i in range(start, len(block_mapping), step):
+-                        gpu_block_id, cpu_block_id = block_mapping[i]
+-                        for cpu_layer_part, gpu_layer_part in zip(cpu_kv_caches, gpu_kv_caches):
+-                            cpu_layer_part[cpu_block_id].copy_(
+-                                gpu_layer_part[gpu_block_id], non_blocking=True)
+-            self.save_stream.synchronize()
+-            self.save_output_queue.put(req_id)
++                    if save_end < (req.num_computed_tokens + req.num_scheduled_tokens) // block_size:
++                        logger.debug(
++                            "save_listener block mismatch for %s group=%d: cpu=%d gpu=%d target=%d",
++                            req_id, group_id,
++                            len(req.cpu_block_ids[group_id]), len(req.gpu_block_ids[group_id]),
++                            (req.num_computed_tokens + req.num_scheduled_tokens) // block_size,
++                        )
++                    for i in range(save_start, save_end):
++                        save_block_mapping[group_id].append(
++                            (req.gpu_block_ids[group_id][i], req.cpu_block_ids[group_id][i]))
++                try:
++                    with torch.npu.stream(self.save_stream):
++                        if self.use_mla:
++                            start, step = self.tp_rank, self.tp_world_size
++                        else:
++                            start, step = 0, 1
++                        for layer_name, gpu_kv_caches in self.gpu_kv_caches.items():
++                            if layer_name not in self.cpu_kv_caches:
++                                continue
++                            group_id = self.layer_to_group_id.get(layer_name, 0)
++                            cpu_kv_caches = self.cpu_kv_caches[layer_name]
++                            block_mapping = save_block_mapping.get(group_id, [])
++                            # Select blocks for this TP rank
++                            selected = block_mapping[start::step] if block_mapping else []
++                            if not selected:
++                                continue
++                            for gpu_block_id, cpu_block_id in selected:
++                                for cpu_layer_part, gpu_layer_part in zip(cpu_kv_caches, gpu_kv_caches):
++                                    cpu_layer_part[cpu_block_id].copy_(
++                                        gpu_layer_part[gpu_block_id], non_blocking=True)
++                    self.save_stream.synchronize()
++                    self.save_output_queue.put(req_id)
++                finally:
++                    pass
++            except Exception:
++                logger.exception("_save_listener error for req %s", req_id)
++                # Put req_id to unblock get_finished() even on error
++                if req_id is not None:
++                    self.save_output_queue.put(req_id)
+ 
+ 
+ # copied and modified from vllm_ascend/worker/model_runner_v1.py
+-- 
+2.34.1
+

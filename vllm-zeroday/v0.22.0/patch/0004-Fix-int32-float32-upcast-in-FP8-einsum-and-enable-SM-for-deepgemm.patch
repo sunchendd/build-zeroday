@@ -1,0 +1,274 @@
+From d8f01f1da54d212491db0a2dd53299f4554bf56a Mon Sep 17 00:00:00 2001
+From: shaowenlong <shaowenlong@xfusion.com>
+Date: Fri, 12 Jun 2026 03:22:34 +0000
+Subject: [PATCH 1/2] Fix int32->float32 upcast in FP8 einsum and enable SM12x
+ deep_gemm path
+
+- deepgemm.cmake: update build config for SM12x support
+- fp8_utils.py: fix int32 to float32 conversion in quantization
+- sparse_attn_indexer.py: remove unused code path
+- fp8_einsum.py: enable SM12x FP8 einsum kernel with proper upcast
+- cuda.py: add SM12x GPU capability recognition
+- deep_gemm.py: refactor to use new deep_gemm SM120 kernels
+- indexer.py: fix data type handling in MLA attention indexer
+---
+ cmake/external_projects/deepgemm.cmake        |  7 +-
+ .../layers/quantization/utils/fp8_utils.py    | 11 ++++
+ .../layers/sparse_attn_indexer.py             |  6 ---
+ .../deepseek_v4/nvidia/ops/fp8_einsum.py      | 20 ++++++--
+ vllm/platforms/cuda.py                        |  6 ++-
+ vllm/utils/deep_gemm.py                       | 51 +++----------------
+ vllm/v1/attention/backends/mla/indexer.py     |  6 +--
+ 7 files changed, 44 insertions(+), 63 deletions(-)
+
+diff --git a/cmake/external_projects/deepgemm.cmake b/cmake/external_projects/deepgemm.cmake
+index 183c42dc7..3b839c93e 100644
+--- a/cmake/external_projects/deepgemm.cmake
++++ b/cmake/external_projects/deepgemm.cmake
+@@ -20,7 +20,7 @@ else()
+   # This ref should be kept in sync with tools/install_deepgemm.sh
+   FetchContent_Declare(
+     deepgemm
+     GIT_REPOSITORY https://github.com/deepseek-ai/DeepGEMM.git
+-    GIT_TAG 891d57b4db1071624b5c8fa0d1e51cb317fa709f
++    GIT_TAG 2073ddb2814892014c33ef4cd1c7d4c148baf1fe
+     GIT_SUBMODULES "third-party/cutlass" "third-party/fmt"
+     GIT_PROGRESS TRUE
+     CONFIGURE_COMMAND ""
+diff --git a/cmake/external_projects/deepgemm.cmake b/cmake/external_projects/deepgemm.cmake
+index 183c42dc7..3b839c93e 100644
+--- a/cmake/external_projects/deepgemm.cmake
++++ b/cmake/external_projects/deepgemm.cmake
+@@ -36,7 +36,7 @@ if(NOT deepgemm_POPULATED)
+ endif()
+ message(STATUS "DeepGEMM is available at ${deepgemm_SOURCE_DIR}")
+ 
+-# DeepGEMM requires CUDA 12.3+ for SM90, 12.9+ for SM100
++# DeepGEMM requires CUDA 12.3+ for SM90, 12.9+ for SM100, 13.0+ for SM120
+ set(DEEPGEMM_SUPPORT_ARCHS)
+ if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.3)
+   list(APPEND DEEPGEMM_SUPPORT_ARCHS "9.0a")
+@@ -46,6 +46,9 @@ if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.9)
+ elseif(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8)
+   list(APPEND DEEPGEMM_SUPPORT_ARCHS "10.0a")
+ endif()
++if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.0)
++  list(APPEND DEEPGEMM_SUPPORT_ARCHS "12.0a")
++endif()
+ 
+ cuda_archs_loose_intersection(DEEPGEMM_ARCHS
+   "${DEEPGEMM_SUPPORT_ARCHS}" "${CUDA_ARCHS}")
+diff --git a/vllm/model_executor/layers/quantization/utils/fp8_utils.py b/vllm/model_executor/layers/quantization/utils/fp8_utils.py
+index 1a301420a..aa9c6ef25 100644
+--- a/vllm/model_executor/layers/quantization/utils/fp8_utils.py
++++ b/vllm/model_executor/layers/quantization/utils/fp8_utils.py
+@@ -1080,6 +1080,17 @@ def deepgemm_post_process_fp8_weight_block(
+         r = wq.size(0) // g
+         wq = wq.view(g, r, d)
+         ws = ws.view(g, r // quant_block_shape[0], d // quant_block_shape[1])
++
++        # On SM120 (arch_major=12), deepgemm's fp8_einsum handles scale
++        # transformation internally via transform_sf_pair_into_required_layout.
++        # Pre-transforming here would cause a double-transformation assertion
++        # failure (sf.size(-2) mismatch after broadcast + UE8M0 packing).
++        # Return raw float32 scales and let fp8_einsum handle the layout.
++        from vllm.platforms import current_platform
++        cap = current_platform.get_device_capability()
++        if cap is not None and cap.major == 12:
++            return wq, ws
++
+         # Pre-transform scale with recipe=(1, 128, 128) to broadcast + pack
+         # into TMA-aligned UE8M0 (INT32) layout. At runtime fp8_einsum uses
+         # recipe=(1, 1, 128) which sees INT dtype and skips re-transform.
+diff --git a/vllm/model_executor/layers/sparse_attn_indexer.py b/vllm/model_executor/layers/sparse_attn_indexer.py
+index 357cd852c..c2c2df777 100644
+--- a/vllm/model_executor/layers/sparse_attn_indexer.py
++++ b/vllm/model_executor/layers/sparse_attn_indexer.py
+@@ -83,12 +83,6 @@ def _decode_topk_logits_width(
+ def _sparse_indexer_requires_deep_gemm(use_fp4_cache: bool = False) -> bool:
+     if not current_platform.is_cuda():
+         return False
+-    if current_platform.is_device_capability_family(120):
+-        # The SM120 fallback path covers FP8-Q sparse indexer calls. FP4-Q
+-        # indexer calls still route through DeepGEMM's fp8_fp4 kernels, so
+-        # fail during construction instead of letting the first forward hit
+-        # the generic DeepGEMM missing-dependency error.
+-        return use_fp4_cache
+     return True
+ 
+ 
+diff --git a/vllm/models/deepseek_v4/nvidia/ops/fp8_einsum.py b/vllm/models/deepseek_v4/nvidia/ops/fp8_einsum.py
+index 09c0f4aa3..f9b745ed1 100644
+--- a/vllm/models/deepseek_v4/nvidia/ops/fp8_einsum.py
++++ b/vllm/models/deepseek_v4/nvidia/ops/fp8_einsum.py
+@@ -235,10 +235,15 @@ def deepseek_v4_fp8_einsum(
+         if group_start != 0 or b_groups != num_groups:
+             b = b.narrow(0, group_start, num_groups)
+ 
++        # Upcast packed int32 UE8M0 scales BEFORE reshaping so the block
++        # counts are computed for float32 (gran_k=128), not int32 (gran_k=512).
++        if b_scale.dtype == torch.int32:
++            from vllm.third_party.deep_gemm import unpack_ue8m0_from_int
++            b_scale = unpack_ue8m0_from_int(b_scale)
++
+         if b_scale.dim() == 2:
+             scale_mn = recipe[1]
+-            scale_k_pack = 4 if b_scale.dtype == torch.int32 else 1
+-            scale_k = recipe[2] * scale_k_pack
++            scale_k = recipe[2]
+             scale_out_blocks = (out_rank + scale_mn - 1) // scale_mn
+             scale_hidden_blocks = (hidden_size + scale_k - 1) // scale_k
+             if b_scale.shape[0] % scale_out_blocks != 0:
+@@ -266,8 +271,17 @@ def deepseek_v4_fp8_einsum(
+             if b_groups != num_groups:
+                 b_scale = b_scale.narrow(0, group_start, num_groups)
+ 
+-        if _use_deepseek_v4_sm12x_triton_fp8_einsum(equation, recipe, b_scale):
++        # SM12x: use the Triton kernel directly (bypass DeepGEMM fp8_einsum
++        # which may assert on scale-layout mismatches for non-standard recipes).
++        # NOTE: Only use Triton fallback when scales are float32 (not
++        # pre-transformed to INT32 UE8M0). With the SM120 fix that skips
++        # pre-transformation for BMM, scales are always float32 here.
++        capability = current_platform.get_device_capability()
++        if capability is not None and capability.major == 12:
+             deepseek_v4_sm12x_fp8_einsum(a, a_scale, b, b_scale, out)
+             return
+ 
++    # For b.dim() == 3 (already reshaped by process_weights_after_loading),
++    # on SM12x the scale is raw float32 (not pre-transformed), so the native
++    # deepgemm-sm120 fp8_einsum handles transformation internally.
+     fp8_einsum(equation, (a, a_scale), (b, b_scale), out, recipe=tuple(recipe))
+diff --git a/vllm/platforms/cuda.py b/vllm/platforms/cuda.py
+index 57814d29b..1ec6f8f33 100644
+--- a/vllm/platforms/cuda.py
++++ b/vllm/platforms/cuda.py
+@@ -555,8 +555,10 @@ class CudaPlatformBase(Platform):
+ 
+     @classmethod
+     def support_deep_gemm(cls) -> bool:
+-        """Currently, only Hopper and Blackwell GPUs are supported."""
+-        return cls.is_device_capability(90) or cls.is_device_capability_family(100)
++        """Currently, Hopper, Blackwell and consumer Blackwell GPUs are supported."""
++        return (cls.is_device_capability(90)
++                or cls.is_device_capability_family(100)
++                or cls.is_device_capability_family(120))
+ 
+     @classmethod
+     def is_integrated_gpu(cls, device_id: int = 0) -> bool:
+diff --git a/vllm/utils/deep_gemm.py b/vllm/utils/deep_gemm.py
+index 4a3804b05..b42163b6d 100644
+--- a/vllm/utils/deep_gemm.py
++++ b/vllm/utils/deep_gemm.py
+@@ -383,23 +383,9 @@ def fp8_fp4_mqa_topk_indices(
+     cu_seqlen_ke: torch.Tensor,
+     topk_indices: torch.Tensor,
+ ) -> bool:
+-    """Write SM120 FP8 MQA top-k indices without materializing full logits."""
+-    if not (
+-        current_platform.is_cuda()
+-        and current_platform.is_device_capability_family(120)
+-        and q[1] is None
+-    ):
+-        return False
+-    from vllm.models.deepseek_v4.nvidia.ops import sm12x_deep_gemm_fallbacks
+-
+-    return sm12x_deep_gemm_fallbacks.fp8_fp4_mqa_topk_indices(
+-        q,
+-        kv,
+-        weights,
+-        cu_seqlen_ks,
+-        cu_seqlen_ke,
+-        topk_indices,
+-    )
++    """Write SM120 FP8 MQA top-k indices without materializing full logits.
++    Now handled by native DeepGEMM MQA logits + manual top-k."""
++    return False
+ 
+ 
+ def _fp8_mqa_logits_sm12x(
+@@ -449,10 +435,6 @@ def fp8_fp4_mqa_logits(
+     Returns:
+         Logits tensor of shape [M, N], dtype `torch.float32`.
+     """
+-    if current_platform.is_device_capability_family(120) and q[1] is None:
+-        return _fp8_mqa_logits_sm12x(
+-            q, kv, weights, cu_seqlen_ks, cu_seqlen_ke, clean_logits
+-        )
+     _lazy_init()
+     if _fp8_fp4_mqa_logits_impl is None:
+         return _missing()
+@@ -511,24 +493,9 @@ def fp8_fp4_paged_mqa_topk_indices(
+     max_model_len: int,
+     topk_indices: torch.Tensor,
+ ) -> bool:
+-    """Write SM120 FP8 paged MQA top-k indices without full logits."""
+-    if not (
+-        current_platform.is_cuda()
+-        and current_platform.is_device_capability_family(120)
+-        and q[1] is None
+-    ):
+-        return False
+-    from vllm.models.deepseek_v4.nvidia.ops import sm12x_deep_gemm_fallbacks
+-
+-    return sm12x_deep_gemm_fallbacks.fp8_fp4_paged_mqa_topk_indices(
+-        q,
+-        kv_cache,
+-        weights,
+-        context_lens,
+-        block_tables,
+-        max_model_len,
+-        topk_indices,
+-    )
++    """Write SM120 FP8 paged MQA top-k indices without full logits.
++    Now handled by native DeepGEMM paged MQA logits + manual top-k."""
++    return False
+ 
+ 
+ def fp8_fp4_paged_mqa_logits(
+@@ -570,10 +537,6 @@ def fp8_fp4_paged_mqa_logits(
+         Logits tensor of shape [B * next_n, max_model_len], dtype
+         `torch.float32`.
+     """
+-    if current_platform.is_device_capability_family(120) and q[1] is None:
+-        return _fp8_paged_mqa_logits_sm12x(
+-            q, kv_cache, weights, context_lens, block_tables, max_model_len
+-        )
+     _lazy_init()
+     if _fp8_fp4_paged_mqa_logits_impl is None:
+         return _missing()
+@@ -617,8 +580,6 @@ def tf32_hc_prenorm_gemm(
+ 
+     See the caller function for shape requirement
+     """
+-    if current_platform.is_device_capability_family(120):
+-        return _tf32_hc_prenorm_gemm_sm12x(x, fn, out, sqrsum, num_split)
+     _lazy_init()
+     if _tf32_hc_prenorm_gemm_impl is None:
+         return _missing()
+diff --git a/vllm/v1/attention/backends/mla/indexer.py b/vllm/v1/attention/backends/mla/indexer.py
+index dd004abaa..798efddd2 100644
+--- a/vllm/v1/attention/backends/mla/indexer.py
++++ b/vllm/v1/attention/backends/mla/indexer.py
+@@ -35,10 +35,7 @@ logger = init_logger(__name__)
+ 
+ def sparse_indexer_max_logits_bytes(is_sm12x: bool | None = None) -> int:
+     if is_sm12x is None:
+-        is_sm12x = (
+-            current_platform.is_cuda()
+-            and current_platform.is_device_capability_family(120)
+-        )
++        is_sm12x = False
+     if "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB" in os.environ:
+         return envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
+     default_mb = 256 if is_sm12x else 512
+@@ -49,7 +46,6 @@ def _uses_deep_gemm_scheduler_metadata() -> bool:
+     return (
+         current_platform.is_cuda()
+         and has_deep_gemm()
+-        and not current_platform.is_device_capability_family(120)
+     )
+ 
+ 
+-- 
+2.33.0
+

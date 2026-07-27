@@ -1,0 +1,116 @@
+From ac0037ca1f9bcc77489e08cb142f1e2a3f649836 Mon Sep 17 00:00:00 2001
+From: Your Name <you@example.com>
+Date: Tue, 9 Jun 2026 13:18:12 +0000
+Subject: [PATCH] adapt indexcache on h20+dsv4flash
+
+Signed-off-by: Your Name <you@example.com>
+---
+ models/deepseek_v4/attention.py    |  8 ++++++--
+ models/deepseek_v4/nvidia/model.py | 30 ++++++++++++++++++++++++++++++
+ 2 files changed, 36 insertions(+), 2 deletions(-)
+
+diff --git a/models/deepseek_v4/attention.py b/models/deepseek_v4/attention.py
+index d052b41..81c60b4 100644
+--- a/models/deepseek_v4/attention.py
++++ b/models/deepseek_v4/attention.py
+@@ -149,6 +149,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
+         cache_config: CacheConfig | None = None,
+         quant_config: QuantizationConfig | None = None,
+         prefix: str = "",
++        skip_topk: bool = False,
+     ) -> None:
+         super().__init__()
+         self.hidden_size = hidden_size
+@@ -204,6 +205,9 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
+         self.topk_indices_buffer = mla_modules.topk_indices_buffer
+ 
+         self.indexer = mla_modules.indexer
++        # When enabled, reuse the top-k indices written by an earlier sparse
++        # layer instead of recomputing them in the current C4A layer.
++        self.skip_topk = skip_topk
+ 
+         # Per-head RMS normalization for Q (no learnable weights)
+         self.q_head_norm = RMSNorm(head_dim, eps=self.eps, has_weight=False)
+@@ -371,7 +375,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
+ 
+             aux_fns[0] = compressor_kv_score
+ 
+-        if self.indexer is not None:
++        if self.indexer is not None and not self.skip_topk:
+             indexer = self.indexer
+ 
+             def indexer_weights_proj() -> torch.Tensor:
+@@ -432,7 +436,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
+         # on the default stream so q stays on its consumer stream (mla_attn
+         # downstream reads q on default). Indexer/compressor go on aux for
+         # overlap with default's GEMM + cache write.
+-        if self.indexer is not None:
++        if self.indexer is not None and not self.skip_topk:
+             aux_streams = self.aux_stream_list
+             indexer = self.indexer
+             # Local ref so the closure keeps a non-None type for mypy.
+diff --git a/models/deepseek_v4/nvidia/model.py b/models/deepseek_v4/nvidia/model.py
+index 25f0a73..686b975 100644
+--- a/models/deepseek_v4/nvidia/model.py
++++ b/models/deepseek_v4/nvidia/model.py
+@@ -17,6 +17,7 @@ from vllm.distributed import (
+     get_tensor_model_parallel_world_size,
+ )
+ from vllm.forward_context import get_forward_context
++from vllm.logger import init_logger
+ from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
+ from vllm.model_executor.layers.fused_moe import FusedMoE
+ from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
+@@ -64,6 +65,7 @@ from vllm.platforms import current_platform
+ from vllm.sequence import IntermediateTensors
+ from vllm.utils.torch_utils import direct_register_custom_op
+ 
++logger = init_logger(__name__)
+ 
+ class DeepseekV4MLP(nn.Module):
+     def __init__(
+@@ -777,6 +779,7 @@ class DeepseekV4Attention(nn.Module):
+             is_neox_style=False,
+         )
+ 
++        _skip_topk = False
+         self.indexer = None
+         if self.compress_ratio == 4:
+             # Only C4A uses sparse attention and hence has indexer.
+@@ -799,6 +802,33 @@ class DeepseekV4Attention(nn.Module):
+                 aux_stream=indexer_aux_stream,
+             )
+ 
++            # Enable IndexCache for DeepSeek V4 C4A layers to reduce
++            # redundant top-k token selection computations in sparse attention.
++            use_index_cache = getattr(config, "use_index_cache", False)
++            if use_index_cache:
++                _index_topk_freq = getattr(config, "index_topk_freq", 1)
++                _index_topk_pattern = getattr(config, "index_topk_pattern", None)
++                c4a_layer_id = (
++                    sum(
++                        max(1, ratio) == 4
++                        for ratio in config.compress_ratios[: layer_id + 1]
++                    )
++                    - 1
++                )
++                if _index_topk_pattern is None:
++                    _skip_topk = max(c4a_layer_id - 1, 0) % _index_topk_freq != 0
++                elif 0 <= layer_id < len(_index_topk_pattern):
++                    _skip_topk = _index_topk_pattern[layer_id] == "S"
++                elif 0 <= c4a_layer_id < len(_index_topk_pattern):
++                    _skip_topk = _index_topk_pattern[c4a_layer_id] == "S"
++
++                logger.info_once(
++                    "DeepSeek V4 IndexCache active for %s (c4a_layer_id=%d): %s sparse top-k indices.",
++                    prefix,
++                    c4a_layer_id,
++                    "reusing cached" if _skip_topk else "computing and caching",
++                )
++
+         mla_modules = DeepseekV4MLAModules(
+             vllm_config=vllm_config,
+             fused_wqa_wkv=self.fused_wqa_wkv,
+-- 
+2.34.1
+

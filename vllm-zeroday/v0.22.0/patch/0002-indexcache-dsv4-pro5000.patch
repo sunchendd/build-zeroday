@@ -1,0 +1,192 @@
+index e6b7419..f8c4d2a 100644
+--- a/vllm/models/deepseek_v4/attention.py
++++ b/vllm/models/deepseek_v4/attention.py
+@@ -60,6 +60,62 @@
+ logger = init_logger(__name__)
++_index_cache_config_logged = False
++_index_cache_c4a_count = 0
+
+
++def _resolve_index_cache_skip_topk(
++    config: DeepseekV2Config | DeepseekV3Config,
++    layer_id: int,
++    *,
++    has_indexer: bool,
++    is_nextn: bool,
++) -> bool:
++    """Whether this layer should reuse top-k indices from a prior layer.
++
++    For DeepSeek-V4, C4A layers are interleaved with non-C4A layers, so
++    the skip decision is based on the C4A ordinal (how many C4A layers
++    have been seen so far), NOT the absolute layer_id.  This ensures the
++    first few C4A layers always compute to populate the shared buffer.
++    """
++    global _index_cache_config_logged, _index_cache_c4a_count
++
++    if not has_indexer or is_nextn:
++        return False
++
++    # C4A ordinal: count of indexer-bearing layers seen so far
++    c4a_idx = _index_cache_c4a_count
++    _index_cache_c4a_count += 1
++
++    index_topk_pattern = getattr(config, "index_topk_pattern", None)
++    index_topk_freq = max(1, getattr(config, "index_topk_freq", 1))
++    index_skip_topk_offset = getattr(config, "index_skip_topk_offset", 2)
++    use_index_cache = getattr(config, "use_index_cache", False)
++
++    # [IndexCache Log] 仅首次调用时打印配置摘要，启动后只一行，不影响推理。
++    # 要关闭此日志，删除下面 if 块即可。
++    if not _index_cache_config_logged:
++        _index_cache_config_logged = True
++        if use_index_cache or index_topk_freq > 1 or index_topk_pattern is not None:
++            logger.info(
++                "IndexCache enabled: use_index_cache=%s index_topk_freq=%d "
++                "index_skip_topk_offset=%d index_topk_pattern=%s",
++                use_index_cache,
++                index_topk_freq,
++                index_skip_topk_offset,
++                index_topk_pattern,
++            )
++
++    if not use_index_cache and index_topk_pattern is None and index_topk_freq == 1:
++        return False
++
++    if index_topk_pattern is None:
++        return (
++            max(c4a_idx - index_skip_topk_offset + 1, 0) % index_topk_freq != 0
++        )
++    if 0 <= c4a_idx < len(index_topk_pattern):
++        return index_topk_pattern[c4a_idx] == "S"
++    return False
++
++
+ def _resolve_dsv4_kv_cache_dtype(
+     use_flashmla_fp8_layout: bool,
+     kv_cache_dtype: str,
+@@ -149,6 +213,7 @@
+         prefix: str,
+         topk_indices_buffer: torch.Tensor | None = None,
+         aux_stream_list: list[torch.cuda.Stream] | None = None,
++        is_nextn: bool = False,
+     ) -> None:
+         super().__init__()
+         config = vllm_config.model_config.hf_config
+@@ -239,6 +304,7 @@
+         )
+         self.indexer_rotary_emb = self.rotary_emb
+         self.topk_indices_buffer = topk_indices_buffer
++        self.skip_topk = False
+
+         self.indexer = None
+         if self.compress_ratio == 4:
+@@ -256,6 +322,25 @@
+                 prefix=f"{prefix}.indexer",
+                 aux_stream=indexer_aux_stream,
+             )
++            self.skip_topk = _resolve_index_cache_skip_topk(
++                config,
++                layer_id,
++                has_indexer=True,
++                is_nextn=is_nextn,
++            )
++            # [IndexCache Log] 仅启动时打印一次，不在 forward 中，不影响推理性能。
++            # 要关闭此日志，删除下面 if 块即可。
++            if self.skip_topk:
++                logger.info(
++                    "IndexCache layer %d skip_topk=True (reuse buffer, no indexer call)",
++                    layer_id,
++                )
++            else:
++                logger.info(
++                    "IndexCache layer %d skip_topk=False (compute topk indices, C4A #%d)",
++                    layer_id,
++                    _index_cache_c4a_count - 1,
++                )
+
+         # Will be None on ROCm for now.
+         self.aux_stream_list = aux_stream_list
+@@ -393,7 +475,7 @@
+
+             aux_fns[0] = compressor_kv_score
+
+-        if self.indexer is not None:
++        if self.indexer is not None and not self.skip_topk:
+             indexer = self.indexer
+
+             def indexer_weights_proj() -> torch.Tensor:
+@@ -432,9 +514,9 @@
+         hidden_states: torch.Tensor,
+         qr: torch.Tensor,
+         kv: torch.Tensor,
+-        kv_score: torch.Tensor,
+-        indexer_kv_score: torch.Tensor,
+-        indexer_weights: torch.Tensor,
++        kv_score: torch.Tensor,
++        indexer_kv_score: torch.Tensor | None,
++        indexer_weights: torch.Tensor | None,
+         positions: torch.Tensor,
+         out: torch.Tensor,  # [num_tokens, padded_heads, head_dim], written in place
+     ) -> None:
+@@ -444,7 +526,7 @@
+         # on the default stream so q stays on its consumer stream (forward_mqa
+         # downstream reads q on default). Indexer/compressor go on aux for
+         # overlap with default's GEMM + cache write.
+-        if self.indexer is not None:
++        if self.indexer is not None and not self.skip_topk:
+             aux_streams = self.aux_stream_list
+             indexer = self.indexer
+             # Local ref so the closure keeps a non-None type for mypy.
+diff --git a/vllm/models/deepseek_v4/nvidia/model.py b/vllm/models/deepseek_v4/nvidia/model.py
+index b732e8b..c1d2e3f 100644
+--- a/vllm/models/deepseek_v4/nvidia/model.py
++++ b/vllm/models/deepseek_v4/nvidia/model.py
+@@ -763,6 +763,7 @@
+         prefix,
+         topk_indices_buffer: torch.Tensor | None = None,
+         aux_stream_list: list[torch.cuda.Stream] | None = None,
++        is_nextn: bool = False,
+     ):
+         super().__init__()
+
+@@ -775,6 +776,7 @@
+             prefix=f"{prefix}.attn",
+             topk_indices_buffer=topk_indices_buffer,
+             aux_stream_list=aux_stream_list,
++            is_nextn=is_nextn,
+         )
+         self.ffn = DeepseekV4MoE(vllm_config, prefix=f"{prefix}.ffn")
+
+diff --git a/vllm/models/deepseek_v4/nvidia/mtp.py b/vllm/models/deepseek_v4/nvidia/mtp.py
+index c75ee1a..daaaf0c 100644
+--- a/vllm/models/deepseek_v4/nvidia/mtp.py
++++ b/vllm/models/deepseek_v4/nvidia/mtp.py
+@@ -118,6 +118,7 @@
+             prefix,
+             topk_indices_buffer=topk_indices_buffer,
+             aux_stream_list=aux_stream_list,
++            is_nextn=True,
+         )
+
+     def forward(
+@@ -216,6 +217,20 @@
+     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+         return self.embed_tokens(input_ids)
+
++    def set_skip_topk(self, skip: bool):
++        """Toggle skip_topk on all MTP layer attention modules.
++
++        Called by the proposer for index_share_for_mtp_iteration:
++        step 0 sets skip=False (compute own indices), steps 1+ set skip=True
++        (reuse indices from the shared buffer).
++        """
++        for layer in self.layers.values():
++            mtp_block = getattr(layer, "mtp_block", None)
++            if mtp_block is not None:
++                attn = getattr(mtp_block, "attn", None)
++                if attn is not None and hasattr(attn, "skip_topk"):
++                    attn.skip_topk = skip
++
+     def forward(
+         self,
+         input_ids: torch.Tensor,

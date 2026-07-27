@@ -1,0 +1,965 @@
+From 7b8d64eb0351604efba56739735731006cfeba2b Mon Sep 17 00:00:00 2001
+From: shenbowen <shenbowen@xfusion.com>
+Date: Sun, 17 May 2026 14:51:45 +0800
+Subject: [PATCH 1/6] apply kvcache2cpu on 910c
+
+Signed-off-by: shenbowen <shenbowen@xfusion.com>
+---
+ .../cpu_offload/cpu_kv_cache_manager.py       | 191 +++++++++----
+ .../cpu_offload/cpu_offload_connector.py      | 265 ++++++++++++++----
+ .../kv_pool/cpu_offload/kv_cache_groups.py    |  76 +++++
+ .../kv_pool/cpu_offload/metadata.py           |  41 ++-
+ .../patch/platform/patch_kv_cache_utils.py    |  13 +-
+ 5 files changed, 464 insertions(+), 122 deletions(-)
+ create mode 100644 vllm_ascend/distributed/kv_transfer/kv_pool/cpu_offload/kv_cache_groups.py
+
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/cpu_offload/cpu_kv_cache_manager.py b/vllm_ascend/distributed/kv_transfer/kv_pool/cpu_offload/cpu_kv_cache_manager.py
+index 03dd597f..12b73ccc 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/cpu_offload/cpu_kv_cache_manager.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/cpu_offload/cpu_kv_cache_manager.py
+@@ -1,3 +1,4 @@
++import math
+ import time
+ from collections import defaultdict
+ 
+@@ -5,11 +6,16 @@ from vllm.logger import logger
+ from vllm.utils.hashing import sha256
+ from vllm.v1.core.block_pool import BlockPool
+ from vllm.v1.core.kv_cache_utils import BlockHash, KVCacheBlock
+-from vllm.v1.core.single_type_kv_cache_manager import get_manager_for_kv_cache_spec
++from vllm.v1.core.single_type_kv_cache_manager import (
++    FullAttentionManager, get_manager_for_kv_cache_spec)
+ from vllm.v1.kv_cache_interface import KVCacheSpec
+ from vllm.v1.metrics.stats import CachingMetrics, PrefixCacheStats
+ from vllm.v1.request import Request
+ 
++from vllm_ascend.distributed.kv_transfer.kv_pool.cpu_offload.kv_cache_groups import (
++    DSACompress1LikeSpec, DSACompress4LikeSpec, DSACompress128LikeSpec,
++    build_kv_cache_groups, empty_block_ids)
++
+ 
+ class CPUCacheStats:
+     def __init__(self, enable_prefix_caching: bool, log_stats: bool = False):
+@@ -53,28 +59,41 @@ class CPUCacheStats:
+ 
+ 
+ class CPUKVCacheManager:
++    """Multi-group CPU KV cache manager.
++
++    Accepts a dict of per-layer KV cache specs, groups them by spec
++    type+value, and manages one SingleTypeKVCacheManager per group.
++    allocate_slots() returns per-group block IDs as tuple[list[int], ...].
++    """
++
+     def __init__(
+         self,
+-        kv_cache_spec: KVCacheSpec,
++        kv_cache_specs: dict[str, KVCacheSpec],
+         num_cpu_blocks: int,
+         caching_hash_algo: str = "builtin",
+         use_eagle: bool = False,
+         enable_kv_cache_events: bool = False,
+     ) -> None:
+-        self.block_size = kv_cache_spec.block_size
++        self.group_specs, self.layer_to_group_id = build_kv_cache_groups(
++            kv_cache_specs)
++        assert len(self.group_specs) > 0
++        self.block_size = min(spec.block_size for spec in self.group_specs)
+         self.num_cpu_blocks = num_cpu_blocks
+         self.caching_hash_fn = sha256 if caching_hash_algo == "sha256" else hash
+         self.use_eagle = use_eagle
+-        self.block_pool = BlockPool(self.num_cpu_blocks, True, self.block_size, enable_kv_cache_events)
+-        self.single_type_manager = get_manager_for_kv_cache_spec(
+-            kv_cache_spec=kv_cache_spec,
+-            block_pool=self.block_pool,
+-            kv_cache_group_id=0,
+-        )
++        self.block_pool = BlockPool(self.num_cpu_blocks, True, self.block_size,
++                                    enable_kv_cache_events)
++        self.single_type_managers = tuple(
++            self._get_manager_for_kv_cache_spec(
++                kv_cache_spec=kv_cache_spec,
++                block_pool=self.block_pool,
++                enable_caching=True,
++                kv_cache_group_id=group_id,
++            ) for group_id, kv_cache_spec in enumerate(self.group_specs))
+         # Record kv block hashes, avoid redundant computation.
+         self.req_to_block_hashes: defaultdict[str, list[BlockHash]] = defaultdict(list)
+         # Record blocks touched in get_matched_num_and_touch().
+-        self.req_to_computed_blocks: defaultdict[str, list[KVCacheBlock]] = defaultdict(list)
++        self.req_to_computed_blocks: dict[str, tuple[list[KVCacheBlock], ...]] = {}
+         # Record the request that failed to allocate.
+         self.req_failed_to_allocate: defaultdict[str, bool] = defaultdict(bool)
+         self.req_to_num_tokens: defaultdict[str, int] = defaultdict(int)
+@@ -82,33 +101,64 @@ class CPUKVCacheManager:
+         # Record request that will be free after finish sending
+         self.req_to_free: defaultdict[str, Request] = defaultdict(Request)
+ 
++    @staticmethod
++    def _get_manager_for_kv_cache_spec(kv_cache_spec: KVCacheSpec, **kwargs):
++        """Use FullAttentionManager for DSACompress*LikeSpec; otherwise delegate."""
++        if isinstance(kv_cache_spec,
++                      (DSACompress1LikeSpec, DSACompress4LikeSpec,
++                       DSACompress128LikeSpec)):
++            return FullAttentionManager(kv_cache_spec, **kwargs)
++        return get_manager_for_kv_cache_spec(kv_cache_spec=kv_cache_spec,
++                                             **kwargs)
++
++    def _find_longest_cache_hit(
++        self,
++        block_hashes: list[BlockHash],
++        max_cache_hit_length: int,
++    ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
++        hit_blocks_per_group: list[list[KVCacheBlock]] = []
++        hit_lengths: list[int] = []
++        alignment_tokens = math.lcm(
++            *(spec.block_size for spec in self.group_specs))
++        for group_id, (manager, kv_cache_spec) in enumerate(
++                zip(self.single_type_managers, self.group_specs)):
++            hit_blocks = manager.__class__.find_longest_cache_hit(
++                block_hashes=block_hashes,
++                max_length=max_cache_hit_length,
++                kv_cache_group_ids=[group_id],
++                block_pool=self.block_pool,
++                kv_cache_spec=kv_cache_spec,
++                use_eagle=self.use_eagle,
++                alignment_tokens=kv_cache_spec.block_size,
++            )[0]
++            hit_blocks_per_group.append(list(hit_blocks))
++            hit_lengths.append(len(hit_blocks) * kv_cache_spec.block_size)
++
++        num_computed_tokens = min(hit_lengths, default=0)
++        num_computed_tokens -= num_computed_tokens % alignment_tokens
++        trimmed_hit_blocks = tuple(
++            hit_blocks[:num_computed_tokens // kv_cache_spec.block_size]
++            for hit_blocks, kv_cache_spec in zip(hit_blocks_per_group,
++                                                 self.group_specs))
++        return trimmed_hit_blocks, num_computed_tokens
++
+     def get_matched_num_and_touch(self, request: Request) -> tuple[int, bool]:
+         # When the request requires prompt logprobs, we skip prefix caching.
+         if request.sampling_params.prompt_logprobs is not None:
+             return 0, False
+         request_id = request.request_id
+-        # The block hashes for the request may already be computed
+-        # if the scheduler has tried to schedule the request before.
+         block_hashes = self.req_to_block_hashes[request_id]
+         if not block_hashes:
+             block_hashes = request.block_hashes
+             self.req_to_block_hashes[request_id] = block_hashes
+         max_cache_hit_length = request.num_tokens - 1
+-        computed_blocks = self.single_type_manager.find_longest_cache_hit(
+-            block_hashes=block_hashes,
+-            max_length=max_cache_hit_length,
+-            kv_cache_group_ids=[0],
+-            block_pool=self.block_pool,
+-            kv_cache_spec=self.single_type_manager.kv_cache_spec,
+-            use_eagle=self.use_eagle,
+-            alignment_tokens=self.block_size,
+-        )
+-        num_computed_tokens = len(computed_blocks[0]) * self.block_size
+-        self.req_to_computed_blocks[request_id] = computed_blocks[0]
+-        # We should touch these blocks in the concurrent scenarios.
+-        self.block_pool.touch(computed_blocks)
+-
+-        # cup prefix cache status set and log
++        computed_blocks, num_computed_tokens = self._find_longest_cache_hit(
++            block_hashes, max_cache_hit_length)
++        self.req_to_computed_blocks[request_id] = computed_blocks
++        # touch expects a flat sequence of KVCacheBlock; flatten across groups
++        all_computed_blocks = [blk for group in computed_blocks for blk in group]
++        self.block_pool.touch(all_computed_blocks)
++
+         assert self.cpu_cache_stats is not None and self.cpu_cache_stats.prefix_cache_stats is not None
+         self.cpu_cache_stats.set_cache_stats(request.num_tokens, num_computed_tokens)
+         self.cpu_cache_stats.cpu_prefix_cache_metrics.observe(self.cpu_cache_stats.prefix_cache_stats)
+@@ -117,63 +167,94 @@ class CPUKVCacheManager:
+         return num_computed_tokens, False
+ 
+     def _release_ahead_touch(self, request_id: str):
+-        computed_blocks = self.req_to_computed_blocks[request_id]
+-        if computed_blocks:
+-            self.single_type_manager.block_pool.free_blocks(reversed(computed_blocks))
+-            self.req_to_computed_blocks.pop(request_id, None)
++        computed_blocks = self.req_to_computed_blocks.get(request_id)
++        if computed_blocks is None:
++            return
++        for group_computed_blocks in computed_blocks:
++            if group_computed_blocks:
++                self.block_pool.free_blocks(reversed(group_computed_blocks))
++        self.req_to_computed_blocks.pop(request_id, None)
+ 
+-    def allocate_slots(self, req_to_num_tokens: dict[str, int], unallocated_req_ids: set[str]) -> dict[str, list[int]]:
++    def allocate_slots(
++        self,
++        req_to_num_tokens: dict[str, int],
++        unallocated_req_ids: set[str],
++    ) -> dict[str, tuple[list[int], ...]]:
+         for request_id in unallocated_req_ids:
+             self._free_slots(request_id)
+-        req_to_new_blocks = {}
++        req_to_new_blocks: dict[str, tuple[list[int], ...]] = {}
+         for request_id, num_tokens in req_to_num_tokens.items():
+             if self.req_failed_to_allocate[request_id]:
+                 continue
+-            new_computed_blocks = self.req_to_computed_blocks[request_id]
+-            num_blocks_to_allocate = self.single_type_manager.get_num_blocks_to_allocate(
+-                request_id=request_id,
+-                num_tokens=num_tokens,
+-                new_computed_blocks=new_computed_blocks,
++            new_computed_blocks = self.req_to_computed_blocks.get(
++                request_id, tuple([] for _ in self.single_type_managers))
++            # For CPU cache: total_computed_tokens = sum of hit blocks * block_size
++            total_computed_tokens = sum(
++                len(new_computed_blocks[group_id]) * kv_cache_spec.block_size
++                for group_id, kv_cache_spec in enumerate(self.group_specs)
++                if group_id < len(new_computed_blocks)
+             )
++            num_blocks_to_allocate = sum(
++                manager.get_num_blocks_to_allocate(
++                    request_id=request_id,
++                    num_tokens=num_tokens,
++                    new_computed_blocks=new_computed_blocks[group_id] if group_id < len(new_computed_blocks) else [],
++                    total_computed_tokens=total_computed_tokens,
++                    num_tokens_main_model=num_tokens,
++                )
++                for group_id, manager in enumerate(self.single_type_managers))
+             if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
+                 self._release_ahead_touch(request_id)
+                 self.req_failed_to_allocate[request_id] = True
+                 continue
+-            # Append the new computed blocks to the request blocks until now to
+-            # avoid the case where the new blocks cannot be allocated.
+-            self.single_type_manager.save_new_computed_blocks(request_id, new_computed_blocks)
+-            # Allocate new blocks but do not cache now.
+-            new_blocks = self.single_type_manager.allocate_new_blocks(request_id, num_tokens)
++            for group_id, manager in enumerate(self.single_type_managers):
++                computed = new_computed_blocks[group_id] if group_id < len(new_computed_blocks) else []
++                local_computed_tokens = len(computed) * self.group_specs[group_id].block_size
++                manager.allocate_new_computed_blocks(
++                    request_id=request_id,
++                    new_computed_blocks=computed,
++                    num_local_computed_tokens=local_computed_tokens,
++                    num_external_computed_tokens=0,
++                )
++            new_blocks = tuple(
++                manager.allocate_new_blocks(request_id, num_tokens, num_tokens)
++                for manager in self.single_type_managers)
+             self.req_to_num_tokens[request_id] = num_tokens
+-            # No need to release ref_cnt because we use officially.
+             self.req_to_computed_blocks.pop(request_id, None)
+-            req_to_new_blocks[request_id] = [block.block_id for block in new_computed_blocks + new_blocks]
++            req_to_new_blocks[request_id] = tuple(
++                [block.block_id
++                 for block in (new_computed_blocks[group_id] if group_id < len(new_computed_blocks) else []) + new_blocks[group_id]]
++                for group_id in range(len(self.single_type_managers)))
+         return req_to_new_blocks
+ 
+     def record_request_cache_and_free_slots(self, request: Request):
+-        logger.debug(f"record_request_cache_and_free_slots for request {request.request_id} in cpu_kv_cache_manager")
++        logger.debug(
++            "record_request_cache_and_free_slots for request %s",
++            request.request_id)
+         self.req_to_free[request.request_id] = request
+ 
+     def cache_and_free_slots(self, request_id: str):
+-        logger.debug(f"Cache and free slots for request {request_id} in cpu_kv_cache_manager")
+         if request_id not in self.req_to_free:
+-            logger.Error(f"request {request_id} not in req_to_free, maybe bug!")
++            logger.warning("request %s not in req_to_free", request_id)
+             return
+         request = self.req_to_free[request_id]
+-        if not self.req_failed_to_allocate[request_id]:
+-            self.single_type_manager.cache_blocks(
+-                request,
+-                self.req_to_num_tokens[request_id],
+-            )
++        failed = self.req_failed_to_allocate[request_id]
++        num_tokens = self.req_to_num_tokens.get(request_id, 0)
++        max_cacheable_tokens = len(request.block_hashes) * self.block_size
++        cacheable_tokens = min(num_tokens, max_cacheable_tokens)
++        if not failed:
++            for manager in self.single_type_managers:
++                manager.cache_blocks(request, cacheable_tokens)
+         self._free_slots(request_id)
+-        logger.debug(f"delete request {request_id} in cpu_kv_cache_manager req_to_free")
+         del self.req_to_free[request_id]
+ 
+     def _free_slots(self, request_id: str):
+         # This function is designed to be reentrant.
+         self._release_ahead_touch(request_id)
+-        self.single_type_manager.free(request_id)
++        for manager in self.single_type_managers:
++            manager.free(request_id)
+         self.req_to_block_hashes.pop(request_id, None)
+         self.req_to_computed_blocks.pop(request_id, None)
+         self.req_failed_to_allocate.pop(request_id, None)
+         self.req_to_num_tokens.pop(request_id, None)
++
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/cpu_offload/cpu_offload_connector.py b/vllm_ascend/distributed/kv_transfer/kv_pool/cpu_offload/cpu_offload_connector.py
+index 481ff73c..d87a2eee 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/cpu_offload/cpu_offload_connector.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/cpu_offload/cpu_offload_connector.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import copy
++import math
+ import queue
+ import threading
+ import time
+@@ -12,20 +13,24 @@ from typing import TYPE_CHECKING, Any, Optional
+ import torch
+ from vllm.config import VllmConfig, get_layers_from_vllm_config
+ from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
+-from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorBase_V1, KVConnectorMetadata, KVConnectorRole
++from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorBase_V1, KVConnectorMetadata, KVConnectorRole, SupportsHMA
+ from vllm.distributed.parallel_state import get_pp_group, get_tp_group
+ from vllm.logger import logger
+ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+ from vllm.model_executor.layers.mamba.abstract import MambaBase
+ from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
+ from vllm.v1.core.sched.output import SchedulerOutput
+-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
++from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec, MLAAttentionSpec
+ 
+ from vllm_ascend.distributed.kv_transfer.kv_pool.cpu_offload.metadata import (
+     MetadataServer,
+     MetadataServerProc,
+     MLAConfig,
+ )
++from vllm_ascend.distributed.kv_transfer.kv_pool.cpu_offload.kv_cache_groups import (
++    DSACompress1LikeSpec, DSACompress4LikeSpec, DSACompress128LikeSpec,
++    build_kv_cache_groups, clone_block_ids, empty_block_ids,
++)
+ 
+ if TYPE_CHECKING:
+     from vllm.forward_context import ForwardContext
+@@ -35,20 +40,23 @@ if TYPE_CHECKING:
+     from vllm.v1.request import Request
+ 
+ from vllm.model_executor.layers.attention import Attention, MLAAttention
++from vllm_ascend.models.layer.attention.layer import DSAAttention
+ 
+ 
+ @dataclass
+ class ReqMeta:
+-    gpu_block_ids: list[int]
+-    cpu_block_ids: list[int]
++    gpu_block_ids: tuple[list[int], ...]
++    cpu_block_ids: tuple[list[int], ...]
+     num_scheduled_tokens: int
+     num_computed_tokens: int
+     num_gpu_computed_tokens: int
+     num_cpu_computed_tokens: int
+ 
+     def update(self, other: "ReqMeta"):
+-        self.gpu_block_ids.extend(other.gpu_block_ids)
+-        self.cpu_block_ids.extend(other.cpu_block_ids)
++        for gpu_block_ids, other_gpu_block_ids in zip(self.gpu_block_ids, other.gpu_block_ids):
++            gpu_block_ids.extend(other_gpu_block_ids)
++        for cpu_block_ids, other_cpu_block_ids in zip(self.cpu_block_ids, other.cpu_block_ids):
++            cpu_block_ids.extend(other_cpu_block_ids)
+         self.num_scheduled_tokens = other.num_scheduled_tokens
+         self.num_computed_tokens = other.num_computed_tokens
+         self.num_gpu_computed_tokens = other.num_gpu_computed_tokens
+@@ -61,20 +69,27 @@ class CPUOffloadingConnectorMetadata(KVConnectorMetadata):
+     finished_req_ids: set[str]
+ 
+ 
+-class CPUOffloadingConnector(KVConnectorBase_V1):
++class CPUOffloadingConnector(KVConnectorBase_V1, SupportsHMA):
+     def __init__(
+         self, vllm_config: VllmConfig, role: KVConnectorRole, kv_cache_config: Optional["KVCacheConfig"] = None
+     ):
+         self._connector_metadata = CPUOffloadingConnectorMetadata(requests={}, finished_req_ids=set())
+-        if not vllm_config.cache_config.enable_prefix_caching:
+-            self.connector_scheduler: CPUOffloadingConnectorScheduler | None = None
++        # Fix: do NOT gate initialization on enable_prefix_caching.
++        # vllm_ascend's attention layer forces enable_prefix_caching=False for
++        # DSA models (DeepSeek-V4 Flash), which would silently disable all
++        # CPU-offload logic. Always initialize based on role so that the
++        # kv_transfer_config path is honored regardless of that flag.
++        if role == KVConnectorRole.SCHEDULER:
++            self.connector_scheduler: CPUOffloadingConnectorScheduler | None = (
++                CPUOffloadingConnectorScheduler(vllm_config)
++            )
+             self.connector_worker: CPUOffloadingConnectorWorker | None = None
+-        elif role == KVConnectorRole.SCHEDULER:
+-            self.connector_scheduler = CPUOffloadingConnectorScheduler(vllm_config)
+-            self.connector_worker = None
+         elif role == KVConnectorRole.WORKER:
+             self.connector_scheduler = None
+             self.connector_worker = CPUOffloadingConnectorWorker(vllm_config)
++        else:
++            self.connector_scheduler = None
++            self.connector_worker = None
+ 
+     # ==============================
+     # Worker-side methods
+@@ -86,7 +101,8 @@ class CPUOffloadingConnector(KVConnectorBase_V1):
+             self.connector_worker.bind_connector_metadata(connector_metadata)
+ 
+     def clear_connector_metadata(self) -> None:
+-        assert self.connector_worker is not None
++        if self.connector_worker is None:
++            return
+         self.connector_worker.clear_connector_metadata()
+ 
+     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+@@ -110,7 +126,8 @@ class CPUOffloadingConnector(KVConnectorBase_V1):
+         pass
+ 
+     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str] | None, set[str] | None]:
+-        assert self.connector_worker is not None
++        if self.connector_worker is None:
++            return None, None
+         return self.connector_worker.get_finished(), None
+ 
+     # Scheduler-side methods
+@@ -133,7 +150,18 @@ class CPUOffloadingConnector(KVConnectorBase_V1):
+     def request_finished(self, request: "Request", block_ids: list[int]) -> tuple[bool, dict[str, Any] | None]:
+         if self.connector_scheduler is not None:
+             self.connector_scheduler.request_finished(request)
+-        return True, None
++            # delay_free_blocks=True: keep GPU blocks until async CPU save completes
++            return True, None
++        # No CPU offload scheduler → free GPU blocks immediately to prevent deadlock
++        return False, None
++
++    def request_finished_all_groups(
++        self, request: "Request", block_ids: tuple[list[int], ...]
++    ) -> tuple[bool, Optional[dict[str, Any]]]:
++        # SupportsHMA: forward to request_finished using the first group's block_ids
++        # so multi-group DeepSeek-V4 (Compress4 + Compress128) doesn't hit the
++        # assert len(kv_cache_groups) == 1 in scheduler._connector_finished.
++        return self.request_finished(request, block_ids[0] if block_ids else [])
+ 
+ 
+ class CPUOffloadingConnectorScheduler:
+@@ -142,6 +170,10 @@ class CPUOffloadingConnectorScheduler:
+         self.vllm_config = vllm_config
+         self.block_size = vllm_config.cache_config.block_size
+         self.use_mla = vllm_config.model_config.use_mla
++        group_specs, _ = build_kv_cache_groups(get_kv_cache_spec(vllm_config))
++        self.num_kv_cache_groups = len(group_specs) if group_specs else 1
++        self.load_align_block_size = math.lcm(
++            *(spec.block_size for spec in group_specs)) if group_specs else self.block_size
+         self.num_gpu_computed_tokens: dict[str, int] = {}
+         self.num_cpu_computed_tokens: dict[str, int] = {}
+         self.allocated_req_ids: set[str] = set()
+@@ -156,9 +188,17 @@ class CPUOffloadingConnectorScheduler:
+ 
+     def get_num_new_matched_tokens(self, ori_request: "Request", num_computed_tokens: int) -> tuple[int, bool]:
+         request = copy.deepcopy(ori_request)
+-        request.get_hash_new_full_blocks = None
++        request._block_hasher = None
+         num_cpu_computed_tokens, load_async = self.zmq_rpc_client.call("get_matched_num_and_touch", request)
+         self.num_gpu_computed_tokens[request.request_id] = num_computed_tokens
++        # Align to load_align_block_size for multi-group consistency
++        aligned = (num_cpu_computed_tokens // self.load_align_block_size) * self.load_align_block_size
++        if aligned != num_cpu_computed_tokens:
++            logger.info(
++                "align cpu matched tokens for %s from %d to %d by block size %d",
++                request.request_id, num_cpu_computed_tokens, aligned, self.load_align_block_size,
++            )
++        num_cpu_computed_tokens = aligned
+         self.num_cpu_computed_tokens[request.request_id] = num_cpu_computed_tokens
+         if num_cpu_computed_tokens - num_computed_tokens >= self.swap_in_threshold:
+             return num_cpu_computed_tokens - num_computed_tokens, load_async
+@@ -184,16 +224,24 @@ class CPUOffloadingConnectorScheduler:
+             self.num_gpu_computed_tokens.keys() - self.allocated_req_ids - scheduler_output.num_scheduled_tokens.keys()
+         )
+         new_cpu_block_ids = self.zmq_rpc_client.call("allocate_slots", num_tokens, unallocated_req_ids)
++        if new_cpu_block_ids:
++            actual_num_groups = max(len(block_ids) for block_ids in new_cpu_block_ids.values())
++            if actual_num_groups > self.num_kv_cache_groups:
++                logger.info(
++                    "update num_kv_cache_groups from %d to %d based on metadata server",
++                    self.num_kv_cache_groups, actual_num_groups,
++                )
++                self.num_kv_cache_groups = actual_num_groups
+         metadata = CPUOffloadingConnectorMetadata(
+             requests={},
+             finished_req_ids=set(self.finished_req_ids),
+         )
+         for req in scheduler_output.scheduled_new_reqs:
+             req_id = req.req_id
+-            gpu_block_ids = req.block_ids[0]
++            gpu_block_ids = clone_block_ids(req.block_ids, self.num_kv_cache_groups)
+             metadata.requests[req_id] = ReqMeta(
+-                gpu_block_ids=[] if gpu_block_ids is None else gpu_block_ids,
+-                cpu_block_ids=new_cpu_block_ids.get(req_id, []),
++                gpu_block_ids=gpu_block_ids,
++                cpu_block_ids=new_cpu_block_ids.get(req_id, empty_block_ids(self.num_kv_cache_groups)),
+                 num_scheduled_tokens=scheduler_output.num_scheduled_tokens[req_id],
+                 num_computed_tokens=req.num_computed_tokens,
+                 num_gpu_computed_tokens=self.num_gpu_computed_tokens[req_id],
+@@ -201,10 +249,10 @@ class CPUOffloadingConnectorScheduler:
+             )
+ 
+         for idx, req_id in enumerate(cached_reqs.req_ids):
+-            gpu_block_ids = cached_reqs.new_block_ids[idx]
++            gpu_block_ids = clone_block_ids(cached_reqs.new_block_ids[idx], self.num_kv_cache_groups)
+             metadata.requests[req_id] = ReqMeta(
+-                gpu_block_ids=[] if gpu_block_ids is None else gpu_block_ids,
+-                cpu_block_ids=new_cpu_block_ids.get(req_id, []),
++                gpu_block_ids=gpu_block_ids,
++                cpu_block_ids=new_cpu_block_ids.get(req_id, empty_block_ids(self.num_kv_cache_groups)),
+                 num_scheduled_tokens=scheduler_output.num_scheduled_tokens[req_id],
+                 num_computed_tokens=cached_reqs.num_computed_tokens[idx],
+                 num_gpu_computed_tokens=cached_reqs.num_computed_tokens[idx],
+@@ -218,7 +266,7 @@ class CPUOffloadingConnectorScheduler:
+ 
+     def request_finished(self, ori_request: "Request"):
+         request = copy.deepcopy(ori_request)
+-        request.get_hash_new_full_blocks = None
++        request._block_hasher = None
+         self.finished_req_ids.append(request.request_id)
+         # inform metadata server to record request, and free it after finish sending
+         self.zmq_rpc_client.call("record_request_cache_and_free_slots", request)
+@@ -239,7 +287,10 @@ class CPUOffloadingConnectorWorker:
+         self.load_stream = torch.npu.Stream()
+         self.save_stream = torch.npu.Stream()
+         self.zmq_rpc_client = MetadataServer.ZMQRPCClient()
+-        self.load_block_mapping: list[tuple[int, int]] = []
++        # Per-group load block mappings; populated in bind_connector_metadata
++        self.load_block_mapping: list[list[tuple[int, int]]] = []
++        self.group_block_sizes: tuple[int, ...] = (vllm_config.cache_config.block_size,)
++        self.layer_to_group_id: dict[str, int] = {}
+         self.save_input_queue: queue.Queue[tuple[str, ReqMeta]] = queue.Queue()
+         self.save_output_queue: queue.Queue[str] = queue.Queue()
+         self.save_thread = threading.Thread(target=self._save_listener)
+@@ -249,11 +300,10 @@ class CPUOffloadingConnectorWorker:
+         # start metadata server to init cpu_kv_cache_manager and handle rpc requests
+         # all dp shared the same metadata server, only start the process on data_rank 0
+         if vllm_config.parallel_config.data_parallel_rank == 0 and self.tp_rank == 0 and self.pp_rank == 0:
+-            config = VllmConfig()
+-            config.cache_config = vllm_config.cache_config
+-            config.parallel_config = vllm_config.parallel_config
+-            config.kv_transfer_config = vllm_config.kv_transfer_config
+-            self.init_metadata_server(config)
++            # Fix: pass original vllm_config directly instead of creating a blank
++            # VllmConfig(), which fails pydantic validation when env vars like
++            # VLLM_ASCEND_ENABLE_FLASHCOMM1=1 require tp_size > 1.
++            self.init_metadata_server(vllm_config)
+         self._wait_for_metadata_process_start()
+ 
+     def init_metadata_server(self, vllm_config: VllmConfig):
+@@ -281,36 +331,76 @@ class CPUOffloadingConnectorWorker:
+                 req = self.requests[req_id]
+             else:
+                 self.requests[req_id] = req
+-            for i in range(req.num_gpu_computed_tokens // self.block_size, req.num_computed_tokens // self.block_size):
+-                self.load_block_mapping.append((req.cpu_block_ids[i], req.gpu_block_ids[i]))
++            for group_id, block_size in enumerate(self.group_block_sizes):
++                load_start = req.num_gpu_computed_tokens // block_size
++                load_end = min(
++                    req.num_computed_tokens // block_size,
++                    len(req.cpu_block_ids[group_id]) if group_id < len(req.cpu_block_ids) else 0,
++                    len(req.gpu_block_ids[group_id]) if group_id < len(req.gpu_block_ids) else 0,
++                )
++                if load_end < req.num_computed_tokens // block_size:
++                    logger.debug(
++                        "bind_connector_metadata block mismatch for %s group=%d: cpu=%d gpu=%d target=%d",
++                        req_id, group_id,
++                        len(req.cpu_block_ids[group_id]) if group_id < len(req.cpu_block_ids) else 0,
++                        len(req.gpu_block_ids[group_id]) if group_id < len(req.gpu_block_ids) else 0,
++                        req.num_computed_tokens // block_size,
++                    )
++                while group_id >= len(self.load_block_mapping):
++                    self.load_block_mapping.append([])
++                for i in range(load_start, load_end):
++                    self.load_block_mapping[group_id].append(
++                        (req.cpu_block_ids[group_id][i], req.gpu_block_ids[group_id][i]))
+         for req_id in connector_metadata.finished_req_ids:
+             if req_id in self.requests:
+                 self.save_input_queue.put((req_id, self.requests[req_id]))
+ 
+     def clear_connector_metadata(self) -> None:
+-        self.load_block_mapping.clear()
++        for mapping in self.load_block_mapping:
++            mapping.clear()
+ 
+     def register_kv_caches(self, kv_caches: dict[str, Sequence[torch.Tensor]]):
+         self.gpu_kv_caches = kv_caches
++        kv_cache_specs = get_kv_cache_spec(self.vllm_config)
++        # Fix: vllm_config.cache_config.block_size may have been modified by
++        # patch_core.py to min(all_kv_group_block_sizes), which for DSA compress-4
++        # models becomes 32 (C4AttnKVStateSpec). The main KV tensor we actually
++        # CPU-offload always has block_size=128. Correct the spec block_size by
++        # reading dimension [1] from the first GPU tensor for each layer.
++        from dataclasses import replace as dc_replace
++        for layer_name, spec in list(kv_cache_specs.items()):
++            if layer_name in kv_caches:
++                gpu_tensors = kv_caches[layer_name]
++                if (gpu_tensors and hasattr(gpu_tensors[0], 'shape')
++                        and len(gpu_tensors[0].shape) >= 2):
++                    actual_block_size = gpu_tensors[0].shape[1]
++                    if actual_block_size != spec.block_size:
++                        logger.info(
++                            "register_kv_caches: correcting block_size for %s "
++                            "from %d to %d (derived from GPU tensor shape)",
++                            layer_name, spec.block_size, actual_block_size,
++                        )
++                        kv_cache_specs[layer_name] = dc_replace(spec, block_size=actual_block_size)
++        group_specs, self.layer_to_group_id = build_kv_cache_groups(kv_cache_specs)
++        self.group_block_sizes = tuple(spec.block_size for spec in group_specs) if group_specs else (self.block_size,)
++        self.layer_names = list(kv_caches.keys())
+         model_config = self.vllm_config.model_config
+         mla_config: MLAConfig | None = None
+         if model_config.use_mla:
+             mla_config = MLAConfig(
+                 model_config.hf_text_config.kv_lora_rank, model_config.hf_text_config.qk_rope_head_dim
+             )
+-        self.cpu_kv_caches = list(
+-            self.zmq_rpc_client.call(
+-                "init_cpu_kv_caches",
+-                self.pp_rank,
+-                self.tp_rank,
+-                get_kv_cache_spec(self.vllm_config),
+-                mla_config,
+-            ).values()
++        # cpu_kv_caches: dict[layer_name -> tensor or tuple[tensor,...]]
++        self.cpu_kv_caches = self.zmq_rpc_client.call(
++            "init_cpu_kv_caches",
++            self.pp_rank,
++            self.tp_rank,
++            kv_cache_specs,
++            mla_config,
+         )
+ 
+     def start_load_kv(self) -> None:
+         self.current_layer = 0
+-        self.gpu_kv_caches_load_iter = iter(self.gpu_kv_caches.values())
+         self.load_kv_layer(0)
+ 
+     def wait_for_layer_load(self) -> None:
+@@ -320,12 +410,20 @@ class CPUOffloadingConnectorWorker:
+         self.load_kv_layer(self.current_layer)
+ 
+     def load_kv_layer(self, layer: int):
+-        if layer == len(self.gpu_kv_caches):
++        if layer >= len(self.layer_names):
++            return
++        layer_name = self.layer_names[layer]
++        # Skip layers that have no CPU cache (not in kv_cache_specs)
++        if layer_name not in self.cpu_kv_caches:
++            return
++        group_id = self.layer_to_group_id.get(layer_name, 0)
++        gpu_kv_caches = self.gpu_kv_caches[layer_name]
++        cpu_kv_caches = self.cpu_kv_caches[layer_name]
++        if group_id >= len(self.load_block_mapping):
+             return
+-        gpu_kv_caches = next(self.gpu_kv_caches_load_iter)
+-        cpu_kv_caches = self.cpu_kv_caches[layer]
++        block_mapping = self.load_block_mapping[group_id]
+         with torch.npu.stream(self.load_stream):
+-            for cpu_block_id, gpu_block_id in self.load_block_mapping:
++            for cpu_block_id, gpu_block_id in block_mapping:
+                 for gpu_layer_part, cpu_layer_part in zip(gpu_kv_caches, cpu_kv_caches):
+                     gpu_layer_part[gpu_block_id].copy_(cpu_layer_part[cpu_block_id], non_blocking=True)
+ 
+@@ -371,29 +469,48 @@ class CPUOffloadingConnectorWorker:
+             self.zmq_rpc_client.call("cache_and_free_slots", req_id)
+ 
+     def _save_listener(self):
+-        save_block_mapping = []
+         while True:
+             req_id, req = self.save_input_queue.get()
+-            for i in range(
+-                req.num_cpu_computed_tokens // self.block_size,
+-                min((req.num_computed_tokens + req.num_scheduled_tokens) // self.block_size, len(req.cpu_block_ids)),
+-            ):
+-                save_block_mapping.append((req.gpu_block_ids[i], req.cpu_block_ids[i]))
++            save_block_mapping: dict[int, list[tuple[int, int]]] = {
++                group_id: [] for group_id in range(len(self.group_block_sizes))
++            }
++            for group_id, block_size in enumerate(self.group_block_sizes):
++                if group_id >= len(req.cpu_block_ids) or group_id >= len(req.gpu_block_ids):
++                    continue
++                save_start = req.num_cpu_computed_tokens // block_size
++                save_end = min(
++                    (req.num_computed_tokens + req.num_scheduled_tokens) // block_size,
++                    len(req.cpu_block_ids[group_id]),
++                    len(req.gpu_block_ids[group_id]),
++                )
++                if save_end < (req.num_computed_tokens + req.num_scheduled_tokens) // block_size:
++                    logger.debug(
++                        "save_listener block mismatch for %s group=%d: cpu=%d gpu=%d target=%d",
++                        req_id, group_id,
++                        len(req.cpu_block_ids[group_id]), len(req.gpu_block_ids[group_id]),
++                        (req.num_computed_tokens + req.num_scheduled_tokens) // block_size,
++                    )
++                for i in range(save_start, save_end):
++                    save_block_mapping[group_id].append(
++                        (req.gpu_block_ids[group_id][i], req.cpu_block_ids[group_id][i]))
+             with torch.npu.stream(self.save_stream):
+-                # MLA: kv_layer is tuple[tensor, tensor] means (rope, nope).
+-                # non-MLA: kv_layer is list[tensor], typically means [k, v].
+                 if self.use_mla:
+                     start, step = self.tp_rank, self.tp_world_size
+                 else:
+                     start, step = 0, 1
+-                for i in range(start, len(save_block_mapping), step):
+-                    gpu_block_id, cpu_block_id = save_block_mapping[i]
+-                    for cpu_kv_caches, gpu_kv_caches in zip(self.cpu_kv_caches, self.gpu_kv_caches.values()):
++                for layer_name, gpu_kv_caches in self.gpu_kv_caches.items():
++                    if layer_name not in self.cpu_kv_caches:
++                        continue
++                    group_id = self.layer_to_group_id.get(layer_name, 0)
++                    cpu_kv_caches = self.cpu_kv_caches[layer_name]
++                    block_mapping = save_block_mapping.get(group_id, [])
++                    for i in range(start, len(block_mapping), step):
++                        gpu_block_id, cpu_block_id = block_mapping[i]
+                         for cpu_layer_part, gpu_layer_part in zip(cpu_kv_caches, gpu_kv_caches):
+-                            cpu_layer_part[cpu_block_id].copy_(gpu_layer_part[gpu_block_id], non_blocking=True)
++                            cpu_layer_part[cpu_block_id].copy_(
++                                gpu_layer_part[gpu_block_id], non_blocking=True)
+             self.save_stream.synchronize()
+             self.save_output_queue.put(req_id)
+-            save_block_mapping.clear()
+ 
+ 
+ # copied and modified from vllm_ascend/worker/model_runner_v1.py
+@@ -419,8 +536,36 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
+     # NOTE: Must process Attention/MLAAttention before MambaBase to maintain
+     # ordering expected by graph parameter update logic in attention backends.
+     mamba_layers: dict[str, MambaBase] = {}
+-    for layer_name, attn_module in attn_layers.items():
+-        if isinstance(attn_module, Attention):
++    for layer_id, (layer_name, attn_module) in enumerate(attn_layers.items()):
++        if isinstance(attn_module, DSAAttention):
++            # Skip MTP layers and the first two DSA layers (compress_ratio=1 heads)
++            if "mtp" in layer_name or layer_id in [0, 1]:
++                continue
++            compress_ratio = getattr(attn_module, "compress_ratio", None)
++            if compress_ratio == 4:
++                dsa_spec_cls = DSACompress4LikeSpec
++            elif compress_ratio == 128:
++                dsa_spec_cls = DSACompress128LikeSpec
++            elif compress_ratio == 1:
++                continue
++            else:
++                # Fallback: try generic get_kv_cache_spec
++                if hasattr(attn_module, "get_kv_cache_spec"):
++                    spec = attn_module.get_kv_cache_spec(vllm_config)
++                    if spec is not None:
++                        kv_cache_spec[layer_name] = spec
++                continue
++            hf_config = vllm_config.model_config.hf_text_config
++            block_size = vllm_config.cache_config.block_size
++            kv_cache_spec[layer_name] = dsa_spec_cls(
++                block_size=block_size,
++                num_kv_heads=1,
++                head_size=hf_config.head_dim,
++                dtype=kv_cache_dtype,
++                cache_dtype_str=vllm_config.cache_config.cache_dtype,
++            )
++
++        elif isinstance(attn_module, Attention):
+             if spec := attn_module.get_kv_cache_spec(vllm_config):
+                 kv_cache_spec[layer_name] = spec
+ 
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/cpu_offload/kv_cache_groups.py b/vllm_ascend/distributed/kv_transfer/kv_pool/cpu_offload/kv_cache_groups.py
+new file mode 100644
+index 00000000..2e8f6a5a
+--- /dev/null
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/cpu_offload/kv_cache_groups.py
+@@ -0,0 +1,76 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""
++KV cache group helpers for CPU offloading with DeepSeek-V4 (DSA) models.
++
++DSAAttention layers use compressed KV (compress_ratio=1/4/128) that don't map
++to standard MLAAttentionSpec or FullAttentionSpec. We introduce lightweight
++marker subclasses so that:
++  - The metadata server can distinguish them from standard MLA and use the
++    correct memory layout (no nope/rope split).
++  - The block manager's spec_manager_map lookup finds FullAttentionManager for
++    these types (since they share the same block-level semantics).
++  - Different compress ratios stay in separate KV groups so their block IDs
++    are managed independently.
++"""
++from dataclasses import dataclass
++
++from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
++
++
++@dataclass(frozen=True)
++class DSACompress1LikeSpec(MLAAttentionSpec):
++    """Marker spec for DSAAttention layers with compress_ratio=1 (SWA-only)."""
++    pass
++
++
++@dataclass(frozen=True)
++class DSACompress4LikeSpec(MLAAttentionSpec):
++    """Marker spec for DSAAttention layers with compress_ratio=4."""
++    pass
++
++
++@dataclass(frozen=True)
++class DSACompress128LikeSpec(MLAAttentionSpec):
++    """Marker spec for DSAAttention layers with compress_ratio=128."""
++    pass
++
++
++def build_kv_cache_groups(
++    kv_cache_specs: dict[str, KVCacheSpec],
++) -> tuple[tuple[KVCacheSpec, ...], dict[str, int]]:
++    """Group layers by identical spec type+value into KV cache groups.
++
++    Returns:
++        group_specs: tuple of unique specs (one per group)
++        layer_to_group_id: mapping layer_name -> group index
++    """
++    group_specs: list[KVCacheSpec] = []
++    layer_to_group_id: dict[str, int] = {}
++    for layer_name, spec in kv_cache_specs.items():
++        for group_id, existing_spec in enumerate(group_specs):
++            if type(existing_spec) is type(spec) and existing_spec == spec:
++                layer_to_group_id[layer_name] = group_id
++                break
++        else:
++            layer_to_group_id[layer_name] = len(group_specs)
++            group_specs.append(spec)
++    return tuple(group_specs), layer_to_group_id
++
++
++def empty_block_ids(num_groups: int) -> tuple[list[int], ...]:
++    """Return a tuple of empty block-ID lists, one per group."""
++    return tuple([] for _ in range(num_groups))
++
++
++def clone_block_ids(
++    block_ids: tuple[list[int], ...] | None,
++    num_groups: int,
++) -> tuple[list[int], ...]:
++    """Clone block_ids, padding or truncating to num_groups."""
++    if block_ids is None:
++        return empty_block_ids(num_groups)
++    cloned = tuple(list(group_ids) for group_ids in block_ids[:num_groups])
++    if len(cloned) < num_groups:
++        cloned += tuple([] for _ in range(num_groups - len(cloned)))
++    return cloned
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/cpu_offload/metadata.py b/vllm_ascend/distributed/kv_transfer/kv_pool/cpu_offload/metadata.py
+index a266c0ff..e23d080a 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/cpu_offload/metadata.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/cpu_offload/metadata.py
+@@ -13,9 +13,18 @@ from vllm.config import KVTransferConfig, VllmConfig
+ from vllm.logger import logger
+ from vllm.utils.network_utils import make_zmq_socket
+ from vllm.utils.torch_utils import get_dtype_size
++from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager, spec_manager_map
+ from vllm.v1.kv_cache_interface import AttentionSpec, MLAAttentionSpec
+ 
+ from vllm_ascend.distributed.kv_transfer.kv_pool.cpu_offload.cpu_kv_cache_manager import CPUKVCacheManager
++from vllm_ascend.distributed.kv_transfer.kv_pool.cpu_offload.kv_cache_groups import (
++    DSACompress1LikeSpec, DSACompress4LikeSpec, DSACompress128LikeSpec)
++
++# Register DSACompress*LikeSpec → FullAttentionManager so that
++# get_manager_for_kv_cache_spec can resolve them by exact type.
++spec_manager_map[DSACompress1LikeSpec] = FullAttentionManager
++spec_manager_map[DSACompress4LikeSpec] = FullAttentionManager
++spec_manager_map[DSACompress128LikeSpec] = FullAttentionManager
+ 
+ 
+ @dataclass
+@@ -72,10 +81,18 @@ class MetadataServer:
+                 # shared_memory_dict is recorded in self to close
+                 self.shared_memory_dict = memory_dict
+                 result = {}
++                # use_mla: layer_size has 4 dims (num_blocks, block_size, heads, head_size)
++                # vs non-mla: 5 dims (2, num_blocks, block_size, heads, head_size)
++                use_mla = (len(layer_size) == 4)
+                 for key, shm in memory_dict.items():
+                     tensor = torch.frombuffer(shm.buf, dtype=layer_dtype).reshape(layer_size)
+                     if mla_config is not None:
+                         tensor = tensor.split([mla_config.nope_dim, mla_config.rope_dim], dim=-1)
++                    elif use_mla:
++                        # DSAAttention case (use_mla=True, mla_config=None):
++                        # Wrap in tuple so zip(gpu_kv_caches, cpu_kv_caches) iterates
++                        # over the whole tensor (indexed by block_id) not by block slice.
++                        tensor = (tensor,)
+                     result[key] = tensor
+             return result
+ 
+@@ -162,24 +179,33 @@ class MetadataServer:
+                 f"cpu_kv_cache_{pp_rank}_{tp_rank}_{layer_name}", nbytes
+             )
+         if use_mla:
+-            assert mla_config is not None
+-            assert layer.head_size == mla_config.rope_dim + mla_config.nope_dim
++            # For standard MLA (e.g., DeepSeek V2/V3), mla_config carries
++            # nope_dim + rope_dim which must equal head_size.
++            # For DSA-based models (e.g., DeepSeek V4 Flash), DeepseekV4Config
++            # may set kv_lora_rank = o_lora_rank, so mla_config arrives
++            # non-None but with wrong dims. Discard it in that case so the
++            # client stores a single tensor without nope/rope split.
++            if (mla_config is not None and
++                    layer.head_size != mla_config.rope_dim + mla_config.nope_dim):
++                mla_config = None
+             self.shared_memory[(pp_rank, tp_rank)] = (shared_memory_dict, layer_size, layer.dtype, mla_config)
+         else:
+             self.shared_memory[(pp_rank, tp_rank)] = (shared_memory_dict, layer_size, layer.dtype, None)
+         if self.num_cpu_blocks == -1 or num_blocks < self.num_cpu_blocks:
+             self.num_cpu_blocks = num_blocks
+-        self.layer = layer
++        self.kv_cache_specs = kv_cache_specs
+         return self.shared_memory[(pp_rank, tp_rank)]
+ 
+     def post_init(self):
+         # different processors in data parallel may call multiple times
+         if hasattr(self, "cpu_block_manager"):
+             return
+-        # do shared_memory() at least once
++        # kv_cache_specs is populated by init_cpu_kv_caches
++        assert hasattr(self, "kv_cache_specs"), (
++            "post_init called before any init_cpu_kv_caches call")
+         logger.info(f"assign cpu num blocks: {self.num_cpu_blocks}")
+         assert self.num_cpu_blocks >= 0
+-        self.cpu_block_manager = CPUKVCacheManager(self.layer, self.num_cpu_blocks)
++        self.cpu_block_manager = CPUKVCacheManager(self.kv_cache_specs, self.num_cpu_blocks)
+         self.functions.update(
+             {
+                 "get_matched_num_and_touch": self.cpu_block_manager.get_matched_num_and_touch,
+@@ -226,7 +252,10 @@ class MetadataServer:
+ class MetadataServerProc:
+     @staticmethod
+     def run_metadata_server(vllm_config: VllmConfig):
+-        if not vllm_config.cache_config.enable_prefix_caching or get_cpu_offload_connector(vllm_config) is None:
++        # Note: Do NOT gate on enable_prefix_caching. Models like DeepSeek V4
++        # have platform.py force enable_prefix_caching=False while still using
++        # CPUOffloadingConnector. The server must run whenever a connector exists.
++        if get_cpu_offload_connector(vllm_config) is None:
+             return
+ 
+         shutdown_requested = False
+diff --git a/vllm_ascend/patch/platform/patch_kv_cache_utils.py b/vllm_ascend/patch/platform/patch_kv_cache_utils.py
+index 9f9ee084..163dab22 100644
+--- a/vllm_ascend/patch/platform/patch_kv_cache_utils.py
++++ b/vllm_ascend/patch/platform/patch_kv_cache_utils.py
+@@ -536,7 +536,18 @@ def get_kv_cache_groups_with_multi_groups(
+         The generated KVCacheGroups
+     """
+     if vllm_config.scheduler_config.disable_hybrid_kv_cache_manager:
+-        unify_hybrid_kv_cache_specs_with_multi_groups(kv_cache_spec_list)
++        # Fix: DeepSeek-V4 uses Compress4AttentionSpec / Compress128AttentionSpec
++        # which are vllm-ascend custom types. unify_hybrid_kv_cache_specs is only
++        # needed for FullAttention+SlidingWindow hybrid models; calling it on
++        # Compress types triggers a spurious AssertionError. Skip it here.
++        from vllm_ascend.core.kv_cache_spec import CompressAttentionSpec
++        has_compress_spec = any(
++            isinstance(spec, CompressAttentionSpec)
++            for layer_specs in kv_cache_spec_list.values()
++            for spec in layer_specs
++        )
++        if not has_compress_spec:
++            unify_hybrid_kv_cache_specs_with_multi_groups(kv_cache_spec_list)
+ 
+     if is_kv_cache_type_attention_free_with_multi_groups(kv_cache_spec_list):
+         # This returns an empty list to allow for the KVCacheManager to handle
+-- 
+2.34.1
+

@@ -1,0 +1,41 @@
+From f77223df0b0091d62564b1435558216c650c079a Mon Sep 17 00:00:00 2001
+From: shaowenlong <shaowenlong@xfusion.com>
+Date: Fri, 26 Jun 2026 17:10:40 +0800
+Subject: [PATCH 2/2] fix: update FlashMLA CMake configuration and sparse
+ attention backend
+
+---
+ cmake/external_projects/flashmla.cmake            | 3 +++
+ vllm/v1/attention/backends/mla/flashmla_sparse.py | 2 +-
+ 2 files changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/cmake/external_projects/flashmla.cmake b/cmake/external_projects/flashmla.cmake
+index 65986df55..bce7b4250 100644
+--- a/cmake/external_projects/flashmla.cmake
++++ b/cmake/external_projects/flashmla.cmake
+@@ -63,6 +63,9 @@ if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.9)
+ elseif(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8)
+     list(APPEND SUPPORT_ARCHS "10.0a")
+ endif()
++if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.0)
++    list(APPEND SUPPORT_ARCHS "12.0a")
++endif()
+ 
+ 
+ cuda_archs_loose_intersection(FLASH_MLA_ARCHS "${SUPPORT_ARCHS}" "${CUDA_ARCHS}")
+diff --git a/vllm/v1/attention/backends/mla/flashmla_sparse.py b/vllm/v1/attention/backends/mla/flashmla_sparse.py
+index 353900f38..c45c2866f 100644
+--- a/vllm/v1/attention/backends/mla/flashmla_sparse.py
++++ b/vllm/v1/attention/backends/mla/flashmla_sparse.py
+@@ -249,7 +249,7 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
+         # Classify single-token queries (plus num_speculative_tokens via
+         # supports_spec_as_decode=True) as decodes; longer queries go to
+         # prefill.
+-        self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
++        self._init_reorder_batch_threshold(1, supports_spec_as_decode=False)  # SM120 disable spec decode (kernel bug)
+ 
+         sm_count = num_compute_units(device.index)
+ 
+-- 
+2.33.0
+

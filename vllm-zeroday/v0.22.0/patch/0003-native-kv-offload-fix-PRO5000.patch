@@ -1,0 +1,25 @@
+--- vllm/vllm/v1/kv_offload/cpu/gpu_worker.py     2026-06-17 14:59:28.662668279 +0800
++++ vllm/vllm/v1/kv_offload/cpu/gpu_worker.py     2026-06-18 23:41:08.296924772 +0800
+@@ -488,6 +488,22 @@
+         if mmap_region is not None and pin_memory:
+             pin_mmap_region(mmap_region)
+ 
++        # On Blackwell PRO5000 (SM120 + CUDA13), concurrent cudaHostAlloc
++        # calls from multiple TP workers can fail with cudaErrorInvalidValue.
++        # Stagger the allocation by local_rank so each worker enters
++        # cudaHostAlloc at a different moment.  This is a no-op on H20/H100
++        # where concurrent allocation works fine.
++        if pin_memory:
++            try:
++                from vllm.distributed.parallel_state import (
++                    get_tensor_model_parallel_rank as _get_tp_rank,
++                )
++                _local_rank = _get_tp_rank()
++                if _local_rank > 0:
++                    time.sleep(_local_rank * 2)
++            except Exception:
++                pass
++
+         gpu_tensors: list[torch.Tensor] = []
+         cpu_tensors: list[torch.Tensor] = []
+         for kv_cache_tensor in kv_caches.tensors:
