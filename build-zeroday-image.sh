@@ -27,13 +27,13 @@ Naming (auto-generates output filename):
 Output naming (tag = all lowercase; filename = first letter capitalized, rest lowercase;
 hyphens -> underscores; saved as .tgz via pigz):
   Model-specific (--model + --hardware):
-    tag:  wings_{engine}:{model}-{hardware}-{ts}
+    tag:  wings-{engine}:{model}-{hardware}-{ts}
     tgz:  Wings_{engine}_{model}_{hardware}_{ts}_{arch}.tgz
   Release        (--hardware, no --model):
-    tag:  wings_{engine}:{version}-{hardware}-{ts}
+    tag:  wings-{engine}:{version}-{hardware}-{ts}
     tgz:  Wings_{engine}_{version}_{hardware}_{ts}_{arch}.tgz
   Generic        (no --hardware, no --model):
-    tag:  wings_{engine}:{version}-{ts}
+    tag:  wings-{engine}:{version}-{ts}
     tgz:  Wings_{engine}_{version}_{ts}_{arch}.tgz
 
   --hardware (机型) allowlist:
@@ -173,20 +173,20 @@ default_target_image() {
     die "Cannot derive a target tag from digest image '${image}'. Please pass --target-image."
   fi
 
-  local engine_tag="${engine//-/_}"   # vllm-ascend -> vllm_ascend
+  local engine_tag="${engine,,}"      # repository names use compatibility-list kebab-case
   local model_l="${model,,}"          # tag rule: all lowercase
   local version_l="${version,,}"
   local hardware_l="${hardware,,}"
 
   if [[ -n "$model_l" && -n "$hardware_l" ]]; then
-    # Model-specific: wings_{engine}:{model}-{hardware}-{timestamp}
-    printf 'wings_%s:%s-%s-%s' "$engine_tag" "$model_l" "$hardware_l" "$timestamp"
+    # Model-specific: wings-{engine}:{model}-{hardware}-{timestamp}
+    printf 'wings-%s:%s-%s-%s' "$engine_tag" "$model_l" "$hardware_l" "$timestamp"
   elif [[ -n "$hardware_l" ]]; then
-    # General release: wings_{engine}:{version}-{hardware}-{timestamp}
-    printf 'wings_%s:%s-%s-%s' "$engine_tag" "$version_l" "$hardware_l" "$timestamp"
+    # General release: wings-{engine}:{version}-{hardware}-{timestamp}
+    printf 'wings-%s:%s-%s-%s' "$engine_tag" "$version_l" "$hardware_l" "$timestamp"
   else
-    # Generic: wings_{engine}:{version}-{timestamp}
-    printf 'wings_%s:%s-%s' "$engine_tag" "$version_l" "$timestamp"
+    # Generic: wings-{engine}:{version}-{timestamp}
+    printf 'wings-%s:%s-%s' "$engine_tag" "$version_l" "$timestamp"
   fi
 }
 

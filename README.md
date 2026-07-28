@@ -30,10 +30,10 @@ Patch and package vLLM / vLLM Ascend Docker images with engine-level deps.
 
 | Mode | Image tag | Tar file |
 |------|-----------|----------|
-| Model-specific `--model`+`--hardware` | `wings_{engine}:{model}-{hw}-{ts}` | `Wings_{engine}_{model}_{hw}_{ts}_{arch}.tar` |
-| GPU release `--hardware`, engine=vllm | `wings_{engine}:{ver}-{hw}-{ts}` | `Wings_{engine}_{ver}_{hw}_{ts}_{arch}.tar` |
-| Ascend release `--hardware`, engine=vllm-ascend | `wings_{engine}:{ver}-{hw}-{ts}` | `Wings_{engine}_{ver}_{ts}_{arch}.tar` |
-| Generic | `wings_{engine}:{ver}-{ts}` | `Wings_{engine}_{ver}_{ts}_{arch}.tar` |
+| Model-specific `--model`+`--hardware` | `wings-{engine}:{model}-{hw}-{ts}` | `Wings_{engine}_{model}_{hw}_{ts}_{arch}.tar` |
+| GPU release `--hardware`, engine=vllm | `wings-{engine}:{ver}-{hw}-{ts}` | `Wings_{engine}_{ver}_{hw}_{ts}_{arch}.tar` |
+| Ascend release `--hardware`, engine=vllm-ascend | `wings-{engine}:{ver}-{hw}-{ts}` | `Wings_{engine}_{ver}_{ts}_{arch}.tar` |
+| Generic | `wings-{engine}:{ver}-{ts}` | `Wings_{engine}_{ver}_{ts}_{arch}.tar` |
 
 ### Patch
 
