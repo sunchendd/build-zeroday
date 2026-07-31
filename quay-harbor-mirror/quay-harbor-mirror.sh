@@ -40,10 +40,17 @@ state_set(){
 }
 
 # Post a message to the Feishu webhook directly (day0-3 has internet). No-op if webhook unset.
+# Usage: notify <srcref:tag> [saved-file-path ...]  — file paths are listed under the image.
 notify(){
   [[ -n "${FEISHU_WEBHOOK:-}" ]] || return 0
+  local ref="$1"; shift
+  local msg="image-saver: new image ${ref}"
+  if [[ $# -gt 0 ]]; then
+    msg+=$'\n'"saved files:"
+    local p; for p in "$@"; do msg+=$'\n'"  ${p}"; done
+  fi
   $CURL --max-time 15 -X POST -H 'Content-Type: application/json' \
-    -d "$(jq -nc --arg t "image-saver: new image $*" '{msg_type:"text",content:{text:$t}}')" \
+    -d "$(jq -nc --arg t "$msg" '{msg_type:"text",content:{text:$t}}')" \
     "$FEISHU_WEBHOOK" >/dev/null 2>&1 || log "  (feishu notify failed)"
 }
 
@@ -76,18 +83,23 @@ discover_tags(){
 }
 
 discover_source(){
-  local src=$1 name srcref filter discover dkind dparam
-  IFS='~' read -r name srcref _ _ filter discover _ <<< "$src"
+  local src=$1 name srcref exclude discover dkind dparam
+  IFS='~' read -r name srcref _ _ exclude discover _ <<< "$src"
   dkind="${discover%%:*}"; dparam="${discover#*:}"
-  discover_tags "$dkind" "$dparam" | grep -E "$filter" | sort -V
+  # exclude is a BLOCKLIST: drop tags matching it (default: nightly). Empty -> ^$
+  # matches only blank lines (there are none), so an unset EXCLUDE saves everything.
+  discover_tags "$dkind" "$dparam" | grep -vE "${exclude:-^$}" | sort -V
 }
 
 # stdin: v-sorted tags; $1: min base (e.g. v0.21.0). stdout: tags whose vX.Y.Z base >= min (empty min = all).
+# Named tags with no vX.Y.Z core (e.g. kimi-k3-a3) always pass — the floor is only
+# meaningful for versioned releases, and sort -V would otherwise rank them below v0.21.0.
 floor_filter(){
   local min="$1" line base smaller
   [[ -z "$min" ]] && { cat; return; }
   while read -r line; do
     [[ -z "$line" ]] && continue
+    [[ "$line" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]] || { printf '%s\n' "$line"; continue; }
     base="$(printf '%s' "$line" | sed -E 's/^(v[0-9]+\.[0-9]+\.[0-9]+).*/\1/')"
     smaller="$(printf '%s\n%s\n' "$min" "$base" | sort -V | head -1)"
     [[ "$smaller" == "$min" ]] && printf '%s\n' "$line"
@@ -164,7 +176,11 @@ save_tag(){
     if save_arch "$srcref" "$group" "$reponame" "$tag" "$arch"; then newly=1; else failed=1; fi
   done
   if [[ $failed -eq 0 ]]; then
-    [[ $do_notify -eq 1 && $was_complete -eq 0 ]] && notify "${srcref}:${tag}"
+    if [[ $do_notify -eq 1 && $was_complete -eq 0 ]]; then
+      local paths=()
+      for arch in "${ARCHES[@]}"; do paths+=("${OUTDIR}/${group}/${arch}/${reponame}-${tag}-${arch}.tgz"); done
+      notify "${srcref}:${tag}" "${paths[@]}"
+    fi
     return 0
   fi
   return 1

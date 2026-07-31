@@ -17,7 +17,7 @@ Every 10 minutes, saves release images from the public registries as `.tgz`
 
 | Source | Saved as | Floor (init) |
 |---|---|---|
-| `quay.io/ascend/vllm-ascend` (+rc, -a3/-310p/-openeuler flavors) | `vllm-ascend/<arch>/vllm-ascend-<tag>-<arch>.tgz` | `v0.21.0` |
+| `quay.io/ascend/vllm-ascend` (every active tag except `nightly*`) | `vllm-ascend/<arch>/vllm-ascend-<tag>-<arch>.tgz` | `v0.21.0` (non-version tags bypass the floor) |
 | `vllm/vllm-openai` (Docker Hub, GA releases) | `vllm/<arch>/vllm-openai-<tag>-<arch>.tgz` | `v0.21.0` |
 
 Each tag is saved **per architecture** (amd64 + aarch64), cross-saved on the x86_64
@@ -29,8 +29,8 @@ is the artifact. Set `KEEP_LOCAL=1` to instead keep it locally as
 `<srcref>:<tag>-<arch>` (bare tag removed) so arches coexist as a cache (each image
 is ~16 GB — watch the disk). To restore one on a host:
 `docker load -i /os_nfs/06_images/openimages/vllm-ascend/aarch64/vllm-ascend-v0.21.0-aarch64.tgz`.
-New releases are saved automatically and announced to a Feishu group; the one-time
-init (`backfill`) does **not** announce.
+New releases are saved automatically and announced to a Feishu group (the message
+lists each saved `.tgz` path); the one-time init (`backfill`) does **not** announce.
 
 ## Why it runs on day0-3 (single host)
 
@@ -68,7 +68,7 @@ Environment-specific gotchas baked into the design:
 
 On **day0-3** (`/usr/local/...`):
 - `bin/quay-harbor-mirror.sh` — the orchestrator (single script; no DMZ helper anymore).
-- `etc/quay-harbor-mirror/config.sh` — sources, filters, floors, output dir, webhook. **Edit this to change scope.**
+- `etc/quay-harbor-mirror/config.sh` — sources, exclude list, floors, output dir, webhook. **Edit this to change scope.**
 - `var/lib/quay-harbor-mirror/state.json` — keys = `srcref:tag:arch` already saved.
 - `var/log/quay-harbor-mirror.log` — cron log.
 - `/etc/cron.d/quay-harbor-mirror` — the schedule: every 10 min **plus an `@reboot` catch-up run** (all flock-guarded, so they never overlap).
@@ -106,8 +106,8 @@ quay-harbor-mirror.sh run
 
 ### Changing what is saved
 Edit `/usr/local/etc/quay-harbor-mirror/config.sh` on day0-3, then the next cron tick picks it up:
-- **Add/remove a source or change the tag filter / floor:** edit `SOURCES` (each line is
-  `name~srcref~group~reponame~filter~discover~min`; `~` is the field separator so `|` is free inside the regex).
+- **Add/remove a source or change the tag blocklist / floor:** edit `SOURCES` (each line is
+  `name~srcref~group~reponame~exclude~discover~min`; `~` is the field separator so `|` is free inside the regex).
 - **Re-save a tag** that is already in state:
   `jq 'del(.saved["<srcref>:<tag>:amd64"],.saved["<srcref>:<tag>:aarch64"])' state.json > t && mv t state.json`
   (and delete the existing `.tgz` files), then `quay-harbor-mirror.sh save <srcref> <tag>` (or wait for the next tick).

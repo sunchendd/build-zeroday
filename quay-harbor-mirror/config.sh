@@ -16,23 +16,27 @@ STATEFILE="${STATEDIR}/state.json"
 LOGFILE="/var/log/quay-harbor-mirror.log"
 
 # ---- Sources to save ----
-# Format: name~srcref~group~reponame~filter~discover~min
+# Format: name~srcref~group~reponame~exclude~discover~min
 #   name     : label for logs
 #   srcref   : pull ref without tag (what `docker pull` uses), e.g. quay.io/ascend/vllm-ascend or vllm/vllm-openai
 #   group    : top-level dir under OUTDIR (vllm | vllm-ascend)
 #   reponame : image name used in the .tgz filename (镜像名字), e.g. vllm-ascend / vllm-openai
-#   filter   : extended regex applied locally; tag saved only if it matches. nightly/branch excluded.
+#   exclude  : extended regex (BLOCKLIST) — tags MATCHING it are skipped. Default drops only nightly.
 #   discover : how to list tags: quay:<repo>  or  github:<github-repo>
-#   min      : floor — only releases with base version >= min are saved (backfill AND cron).
-#              Empty = no floor (save everything matching the filter).
+#   min      : floor — only vX.Y.Z releases with base version >= min are saved (backfill AND cron).
+#              Non-version tags (e.g. kimi-k3-a3) always bypass the floor. Empty = no floor.
 # NB: Docker Hub's catalog API is blocked, but `docker pull` works through the daemon
 #     mirror (docker.m.daocloud.io), so vllm release tags are discovered via the GitHub
 #     releases API and pulled through the mirror.
-FILTER_ASCEND='^v[0-9]+\.[0-9]+\.[0-9]+(rc[0-9]+)?((-a3|-310p|-openeuler))*$'
-FILTER_VLLM='^v[0-9]+\.[0-9]+\.[0-9]+$'
+# Blocklist: a tag is saved UNLESS it matches EXCLUDE. Drops nightly builds, moving
+# tags (latest, main* — they'd freeze on first pull since state keys by tag name), and
+# ancient releases-vX.Y.Z (the vX.Y.Z floor doesn't gate them). All named model tags
+# (kimi-k3, deepseekv4, glm5, glm5.2, bailing-flash, ...) and current vX.Y.Z releases
+# are kept. Edit to widen/narrow.
+EXCLUDE='nightly|latest|^main|releases-'
 SOURCES=(
-  "ascend~quay.io/ascend/vllm-ascend~vllm-ascend~vllm-ascend~${FILTER_ASCEND}~quay:ascend/vllm-ascend~v0.21.0"
-  "vllm~vllm/vllm-openai~vllm~vllm-openai~${FILTER_VLLM}~github:vllm-project/vllm~v0.21.0"
+  "ascend~quay.io/ascend/vllm-ascend~vllm-ascend~vllm-ascend~${EXCLUDE}~quay:ascend/vllm-ascend~v0.21.0"
+  "vllm~vllm/vllm-openai~vllm~vllm-openai~${EXCLUDE}~github:vllm-project/vllm~v0.21.0"
 )
 
 # ---- Architectures to save per tag ----
