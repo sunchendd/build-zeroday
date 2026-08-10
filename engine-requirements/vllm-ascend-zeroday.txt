@@ -2,7 +2,7 @@
 # regardless of version. Maintained in this repo (not in the vllm-ascend-zeroday submodule).
 # The shared Dockerfile auto-selects this file from the engine derived via PATCH_DIR.
 ray
-mooncake-transfer-engine
+mooncake-transfer-engine-npu
 opentelemetry-sdk>=1.26.0
 opentelemetry-api>=1.26.0
 opentelemetry-exporter-otlp>=1.26.0

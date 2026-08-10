@@ -1,2 +1,2 @@
 ray[cgraph]
-mooncake-transfer-engine
+mooncake-transfer-engine-npu
